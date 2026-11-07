@@ -155,6 +155,8 @@ begin_transaction() {
         /etc/sing-box/config.json
         /etc/unbound/unbound.conf.d/warp-pipe-proxy.conf
         /etc/systemd/system/warp-pipe-proxy.service
+        "$ROOT/settings.json"
+        "$ROOT/credentials.json"
         "$ROOT/clients.txt"
         "$ROOT/client-sing-box.json"
         "$ROOT/summary.json"

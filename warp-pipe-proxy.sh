@@ -73,7 +73,7 @@ if [[ $MODE == install ]]; then
          |  |    |
          |  |    |         YOUR SERVER. YOUR TUNNEL.
          |  |    |
-         |  |    |         SOCKS5 + VLESS REALITY
+         |  |    |         VLESS REALITY
          |_______|         Powered by sing-box
 
       ==========================================================
@@ -112,32 +112,12 @@ read_setting() {
 }
 # Проверяем реальный трафик, а не только успешный запуск процессов.
 check_installation() {
-    stage 'Checking services, DNS, SOCKS and VLESS Reality'
-    log 'Checking configuration, services, recursive DNS and local authenticated SOCKS'
+    stage 'Checking services, DNS and VLESS Reality'
+    log 'Checking configuration, services, recursive DNS and authenticated VLESS Reality'
     sing-box check -c /etc/sing-box/config.json
     wait_services
     dig +time=8 +tries=1 @127.0.0.1 -p "$(read_setting dns_port)" example.com A | grep -q 'status: NOERROR'
     dig +tcp +time=8 +tries=1 @127.0.0.1 -p "$(read_setting dns_port)" example.com A | grep -q 'status: NOERROR'
-    # Пароль curl получает через stdin: он не попадает в аргументы процесса и журнал.
-    python3 - "$ROOT" <<'PY'
-import json
-import subprocess
-from pathlib import Path
-import sys
-
-settings_directory = Path(sys.argv[1])
-settings = json.loads((settings_directory / 'settings.json').read_text())
-credentials = json.loads((settings_directory / 'credentials.json').read_text())
-curl_config = (
-    f'proxy = "socks5h://127.0.0.1:{settings["socks_port"]}"\n'
-    f'proxy-user = "{settings["socks_user"]}:{credentials["socks_password"]}"\n'
-)
-subprocess.run(
-    ['curl', '--noproxy', '', '--config', '-', '--fail', '--silent', '--show-error',
-     '--max-time', '30', 'https://example.com', '-o', '/dev/null'],
-    input=curl_config, text=True, check=True,
-)
-PY
     # Временный клиент выполняет HTTPS-запрос через VLESS Reality без прямого обхода.
     python3 "$BASE/probe.py"
     wait_services
@@ -278,8 +258,8 @@ initialize_settings_and_credentials() {
     fi
     python3 "$BASE/configure.py" init
     python3 "$BASE/configure.py" summary
-    log 'Settings are persistent; existing passwords, UUID and keys are reused'
-    for key in socks_port vless_port dns_port; do
+    log 'Settings are persistent; existing UUID and Reality keys are reused'
+    for key in vless_port dns_port; do
         port=$(read_setting "$key")
         if grep -qx "$port" <<< "$SSH_PORTS"; then
             log ERROR 'A configured proxy port collides with SSH'
@@ -348,7 +328,7 @@ prepare_proxy_service() {
     sing_box_binary=$(command -v sing-box)
     cat > "$STAGE/warp-pipe-proxy.service" <<EOF
 [Unit]
-Description=Managed SOCKS and VLESS Reality proxy
+Description=Managed VLESS Reality proxy
 Wants=network-online.target
 After=network-online.target unbound.service
 Requires=unbound.service
@@ -377,6 +357,8 @@ apply_validated_configuration() {
     protect_listeners
     begin_transaction
     stage 'Applying validated configurations'
+    install -m 600 "$STAGE/settings.json" "$ROOT/settings.json"
+    install -m 600 "$STAGE/credentials.json" "$ROOT/credentials.json"
     install -m 640 -o root -g warp-pipe-proxy "$STAGE/config.json" /etc/sing-box/config.json
     install -m 644 "$STAGE/unbound.conf" /etc/unbound/unbound.conf.d/warp-pipe-proxy.conf
     if (( ! CONTAINER_MODE )); then
@@ -410,7 +392,8 @@ configure_firewall() {
     for port in $SSH_PORTS; do
         ufw allow "$port/tcp" comment 'warp-pipe-proxy SSH preservation'
     done
-    ufw allow "$(read_setting socks_port)/tcp" comment 'warp-pipe-proxy SOCKS'
+    log 'Removing legacy installer-managed SOCKS firewall rules'
+    python3 "$BASE/configure.py" remove-legacy-socks-rules
     ufw allow "$(read_setting vless_port)/tcp" comment 'warp-pipe-proxy Reality'
     if [[ $UFW_ACTIVE == no ]]; then
         ufw default deny incoming
@@ -436,7 +419,7 @@ finish_installation() {
     configure_bbr || log WARN 'BBR skipped after an optional optimization error'
     rm -rf -- "$STAGE"
     banner 'DONE | Installation and local checks completed'
-    log SUCCESS 'SUCCESS: SOCKS + VLESS Reality configured; Hysteria2/Certbot not installed'
+    log SUCCESS 'SUCCESS: VLESS Reality configured'
     log "Client links (secrets): $ROOT/clients.txt; settings: $ROOT/settings.json; credentials: $ROOT/credentials.json"
     log "sing-box client profile: $ROOT/client-sing-box.json; import it on the client"
     log WARN 'For LAN access, change the client profile server address to the laptop IP and published port'

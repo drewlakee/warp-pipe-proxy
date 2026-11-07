@@ -81,6 +81,8 @@ configure_bbr
                 (root / folder).mkdir(parents=True, exist_ok=True)
             config = root / 'etc/sing-box/config.json'
             config.write_text('old')
+            for name in ('settings.json', 'credentials.json'):
+                (root / 'root' / name).write_text('legacy')
             result = subprocess.run(['bash', '-c', f'''
 set -Eeuo pipefail
 source "{root}/runtime.sh"
@@ -100,10 +102,14 @@ UFW_ACTIVE=yes
 ufw() {{ echo "FIREWALL: $*"; }}
 printf new > "{config}"
 printf new > "$ROOT/clients.txt"
+printf migrated > "$ROOT/settings.json"
+printf migrated > "$ROOT/credentials.json"
 exit 17
 '''], text=True, capture_output=True)
             self.assertEqual(result.returncode, 17, result.stderr)
             self.assertEqual(config.read_text(), 'old')
+            for name in ('settings.json', 'credentials.json'):
+                self.assertEqual((root / 'root' / name).read_text(), 'legacy')
             self.assertFalse((root / 'root/clients.txt').exists())
             self.assertIn('service states restored', result.stdout)
             self.assertIn('FIREWALL: reload', result.stdout)
