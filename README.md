@@ -53,6 +53,9 @@ bash warp-pipe-proxy.sh install
 | `sudo bash warp-pipe-proxy.sh check --container` | Проверка прокси и DNS без проверки UFW и fail2ban |
 | `sudo bash warp-pipe-proxy.sh check` | Проверка конфигурации, служб, DNS и VLESS |
 | `sudo bash warp-pipe-proxy.sh client-profile` | Вывод полного профиля sing-box из сохранённых настроек |
+| `sudo bash warp-pipe-proxy.sh status` | Быстрый статус служб и порта |
+| `sudo bash warp-pipe-proxy.sh doctor --url https://ya.ru/` | Сравнение прямого доступа и VLESS |
+| `sudo bash warp-pipe-proxy.sh logs --follow` | Просмотр журнала в реальном времени |
 | `sudo bash warp-pipe-proxy.sh client-config` | Вывод сохранённых ссылок подключения |
 
 `client-config` читает `/etc/warp-pipe-proxy/clients.txt`, который создаётся после успешных проверок. Ссылки содержат данные доступа; команда не записывает их в журнал установщика.
@@ -210,6 +213,7 @@ DNS клиента отправляет запросы через DoH Cloudflare
 | Файл | Назначение |
 | --- | --- |
 | `warp-pipe-proxy.sh` | Основной установщик и команды обслуживания |
+| `admin.py` | Статус, диагностика, журнал и экспорт с адресом подключения |
 | `configure.py` | Создание и проверка настроек, генерация конфигов и ссылок |
 | `logging.sh` | Уровни сообщений, плашки и цветной вывод в терминал |
 | `runtime.sh` | Проверки окружения, откат, проверка служб и настройка BBR |
@@ -226,7 +230,7 @@ DNS клиента отправляет запросы через DoH Cloudflare
 ```bash
 bash -n warp-pipe-proxy.sh runtime.sh logging.sh
 shellcheck -e SC1091 warp-pipe-proxy.sh runtime.sh logging.sh
-python3 -B -m unittest test_configure test_runtime test_logging
+python3 -B -m unittest test_configure test_runtime test_logging test_admin
 ```
 
 Интеграционную проверку запускайте в отдельном Linux-окружении с Python 3, sing-box, curl и доступом в интернет:
@@ -248,3 +252,44 @@ python3 -B test_vless_integration.py
 В обычном режиме удаляются только правила UFW с точной меткой `warp-pipe-proxy SOCKS`, включая правила для ранее изменённых портов. Правила без этой метки, firewall провайдера и публикации Podman автоматически не меняются. В контейнерном режиме UFW не затрагивается: удалите старую публикацию `1081` при пересоздании контейнера и ненужные внешние разрешения самостоятельно.
 
 На телефоне включите sing-box в VPN/TUN-режиме и отключите встроенный SOCKS-прокси Telegram. Проверка VLESS использует временный локальный прокси на `127.0.0.1`; публичного SOCKS-сервера больше нет.
+
+## Диагностика и удобный экспорт
+
+Все команды выполняются в установленной Ubuntu или внутри контейнера. `status` быстро проверяет службы и принадлежность порта, без сетевых запросов. `doctor` проверяет конфигурацию, DNS по UDP/TCP, прямой доступ по IPv4/IPv6 и HTTPS через временный VLESS-клиент. Он ничего не перенастраивает.
+
+```bash
+sudo bash warp-pipe-proxy.sh status
+sudo bash warp-pipe-proxy.sh doctor
+sudo bash warp-pipe-proxy.sh doctor --url https://ya.ru/
+sudo bash warp-pipe-proxy.sh check --container --url https://ya.ru/
+sudo bash warp-pipe-proxy.sh logs --follow
+sudo bash warp-pipe-proxy.sh logs --since '10 minutes ago' --filter '172.64.'
+```
+
+`check --url` сначала выполняет обязательные проверки установки, затем диагностику сайта. В `doctor` HTTP 3xx/4xx/5xx означает полученный ответ, а не сбой транспорта. Перенаправления и ресурсы страницы не загружаются. Ошибка IPv6 выводится как предупреждение и сама по себе не делает диагностику неуспешной: у выбранного сайта может не быть AAAA, либо проблема может быть в DNS/маршруте. Команда не доказывает доступность всех IPv6-ресурсов или подключение телефона извне. Проверяйте также журнал клиента.
+
+Для Podman можно экспортировать профиль с адресом ноутбука и внешним портом без редактирования JSON:
+
+```bash
+umask 077
+sudo bash warp-pipe-proxy.sh client-profile --endpoint 192.168.1.10 --port 10443 > client-sing-box.json
+```
+
+`--endpoint` принимает IPv4/IPv6-адрес, включая частный адрес LAN. Меняются только адрес и порт в выводимом профиле; настройки сервера, SNI, UUID и ключи не изменяются. Вывод содержит секрет доступа, не публикуйте его. `--help` показывает доступные команды и параметры. `logs --filter` ищет буквальную подстроку, не регулярное выражение.
+
+Реализация сервисных команд — `admin.py`, тесты — `test_admin.py`. Для проверки запускайте `python3 -B -m unittest test_configure test_runtime test_logging test_admin`.
+
+## Команда в PATH
+
+После успешной установки доступна команда `warp-pipe-proxy` из любой папки:
+
+```bash
+sudo warp-pipe-proxy status
+sudo warp-pipe-proxy doctor --url https://ya.ru/
+sudo warp-pipe-proxy logs --follow
+sudo warp-pipe-proxy check --container
+```
+
+Запускатель расположен в `/usr/local/bin/warp-pipe-proxy`, а независимая копия шести рабочих скриптов — в `/usr/local/lib/warp-pipe-proxy`. Исходную папку после установки можно переместить или удалить. Настройки shell менять не требуется; если `/usr/local/bin` отсутствует в PATH, используйте полный путь к команде.
+
+Для обновления кода повторите установку из новой исходной папки. `sudo warp-pipe-proxy install` повторно применяет уже установленную версию, не скачивает обновления; в контейнере обязательно добавляйте `--container`. Чужие файлы с совпадающими путями установщик не перезаписывает. Установка команды включена в откат конфигурации.

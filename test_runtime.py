@@ -50,7 +50,7 @@ ss() {
 
     def test_bbr_failure_is_optional_and_restores_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
-            runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/')
+            runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/').replace('/usr/local/', directory + '/usr/local/')
             path = Path(directory) / 'runtime.sh'
             path.write_text(runtime)
             result = subprocess.run(['bash', '-c', f'''
@@ -74,13 +74,16 @@ configure_bbr
     def test_exit_failure_restores_files_and_removes_new_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/')
+            runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/').replace('/usr/local/', directory + '/usr/local/')
             (root / 'runtime.sh').write_text(runtime)
             for folder in ('etc/sing-box', 'etc/unbound/unbound.conf.d', 'etc/fail2ban/jail.d',
                            'etc/systemd/system', 'etc/default', 'etc/ufw', 'root', 'backup'):
                 (root / folder).mkdir(parents=True, exist_ok=True)
             config = root / 'etc/sing-box/config.json'
             config.write_text('old')
+            launcher = root / 'usr/local/bin/warp-pipe-proxy'
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text('old launcher')
             for name in ('settings.json', 'credentials.json'):
                 (root / 'root' / name).write_text('legacy')
             result = subprocess.run(['bash', '-c', f'''
@@ -104,10 +107,15 @@ printf new > "{config}"
 printf new > "$ROOT/clients.txt"
 printf migrated > "$ROOT/settings.json"
 printf migrated > "$ROOT/credentials.json"
+printf changed > "{launcher}"
+mkdir -p "{root}/usr/local/lib/warp-pipe-proxy"
+printf new > "{root}/usr/local/lib/warp-pipe-proxy/admin.py"
 exit 17
 '''], text=True, capture_output=True)
             self.assertEqual(result.returncode, 17, result.stderr)
             self.assertEqual(config.read_text(), 'old')
+            self.assertEqual(launcher.read_text(), 'old launcher')
+            self.assertFalse((root / 'usr/local/lib/warp-pipe-proxy').exists())
             for name in ('settings.json', 'credentials.json'):
                 self.assertEqual((root / 'root' / name).read_text(), 'legacy')
             self.assertFalse((root / 'root/clients.txt').exists())
@@ -145,7 +153,7 @@ sleep() { :; }
     def test_container_rollback_leaves_firewall_and_fail2ban_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/')
+            runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/').replace('/usr/local/', directory + '/usr/local/')
             (root / 'runtime.sh').write_text(runtime)
             for folder in ('etc/sing-box', 'etc/unbound/unbound.conf.d', 'etc/fail2ban/jail.d',
                            'etc/systemd/system', 'etc/default', 'etc/ufw', 'root', 'backup'):
@@ -181,6 +189,45 @@ exit 17
             self.assertNotIn('fail2ban', (root / 'calls').read_text())
             self.assertNotIn('UNEXPECTED', result.stdout)
             self.assertNotIn('/etc/ufw', (root / 'backup/paths').read_text())
+
+    def test_installed_command_survives_source_removal_and_reinstall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = (BASE / 'runtime.sh').read_text().replace('/usr/local/', directory + '/usr/local/')
+            (root / 'runtime.sh').write_text(runtime)
+            source = root / 'source'
+            source.mkdir()
+            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py'):
+                (source / name).write_text((BASE / name).read_text())
+            stage = root / 'stage'
+            stage.mkdir()
+            result = subprocess.run(['bash', '-c', f'''
+set -Eeuo pipefail
+source "{root}/runtime.sh"
+BASE="{source}"
+STAGE="{stage}"
+log() {{ :; }}
+install_cli_command
+rm -rf "$BASE"
+"{root}/usr/local/bin/warp-pipe-proxy" --help
+BASE="{root}/usr/local/lib/warp-pipe-proxy"
+install_cli_command
+"{root}/usr/local/bin/warp-pipe-proxy" --help
+'''], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('doctor', result.stdout)
+
+    def test_cli_refuses_unmanaged_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = (BASE / 'runtime.sh').read_text().replace('/usr/local/', directory + '/usr/local/')
+            (root / 'runtime.sh').write_text(runtime)
+            command = root / 'usr/local/bin/warp-pipe-proxy'
+            command.parent.mkdir(parents=True)
+            command.write_text('unrelated command')
+            result = subprocess.run(['bash', '-c', f'source "{root}/runtime.sh"; log() {{ :; }}; check_cli_paths'], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(command.read_text(), 'unrelated command')
 
     def test_probe_has_no_direct_fallback_or_private_key(self):
         config = probe.client_config({'vless_port': 10443, 'reality_host': 'example.com'},

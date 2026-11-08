@@ -152,6 +152,8 @@ begin_transaction() {
     mkdir -p "$BACKUP/transaction"
     : > "$BACKUP/paths"
     local managed_paths=(
+        /usr/local/bin/warp-pipe-proxy
+        /usr/local/lib/warp-pipe-proxy
         /etc/sing-box/config.json
         /etc/unbound/unbound.conf.d/warp-pipe-proxy.conf
         /etc/systemd/system/warp-pipe-proxy.service
@@ -245,3 +247,40 @@ configure_bbr() (
     log WARN 'BBR could not be configured; installation remains successful'
     exit 0
 )
+
+# Не перезаписываем чужую команду или каталог с совпавшим именем.
+check_cli_paths() {
+    local command_path=/usr/local/bin/warp-pipe-proxy bundle=/usr/local/lib/warp-pipe-proxy
+    if [[ -L $command_path ]] || { [[ -e $command_path ]] && ! grep -qx '# Warp Pipe Proxy managed launcher' "$command_path"; }; then
+        log ERROR "Refusing to overwrite unmanaged command: $command_path"
+        return 1
+    fi
+    if [[ -L $bundle ]] || { [[ -e $bundle ]] && [[ ! -f $bundle/.managed ]]; }; then
+        log ERROR "Refusing to overwrite unmanaged directory: $bundle"
+        return 1
+    fi
+}
+
+# Копия скриптов не зависит от исходной папки. Сначала готовим её целиком,
+# поэтому повторная установка через установленную команду не копирует файл сам в себя.
+install_cli_command() {
+    local file bundle=/usr/local/lib/warp-pipe-proxy
+    check_cli_paths
+    install -d -m 755 "$STAGE/cli"
+    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py; do
+        install -m 644 "$BASE/$file" "$STAGE/cli/$file"
+    done
+    install -d -m 755 /usr/local/bin "$bundle"
+    for file in "$STAGE/cli/"*; do
+        install -m 644 "$file" "$bundle/${file##*/}"
+    done
+    touch "$bundle/.managed"
+    chmod 644 "$bundle/.managed"
+    cat > "$STAGE/warp-pipe-proxy" <<'LAUNCHER'
+#!/bin/sh
+# Warp Pipe Proxy managed launcher
+exec /bin/bash /usr/local/lib/warp-pipe-proxy/warp-pipe-proxy.sh "$@"
+LAUNCHER
+    install -m 755 "$STAGE/warp-pipe-proxy" /usr/local/bin/warp-pipe-proxy
+    log SUCCESS 'Installed command: /usr/local/bin/warp-pipe-proxy'
+}

@@ -9,29 +9,40 @@ BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MODE=''
 CONTAINER_MODE=0
 MODE_SELECTED=0
-# Флаг задаётся явно: отсутствие прав на firewall само по себе не отключает защиту.
-for argument in "$@"; do
-    case "$argument" in
+# Сервисные команды не запускают установку и не создают журналы с секретами профиля.
+CLI_ARGS=("$@")
+CHECK_URL=''
+while (( $# )); do
+    case "$1" in
         --container) CONTAINER_MODE=1 ;;
-        install|check|client-config|client-profile)
-            if (( MODE_SELECTED )); then
-                echo 'Specify only one command: install, check, client-config or client-profile'
-                exit 2
-            fi
-            MODE=$argument
+        --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
+        install|check|status|doctor|logs|client-config|client-profile)
+            if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
+            MODE=$1
             MODE_SELECTED=1
             ;;
-        *)
-            echo 'Usage: sudo bash warp-pipe-proxy.sh <install|check|client-config|client-profile> [--container]'
-            exit 2
+        --url|--endpoint|--port|--since|--filter)
+            [[ $# -ge 2 ]] || { echo "Missing value for $1"; exit 2; }
+            if [[ $1 == --url ]]; then CHECK_URL=$2; fi
+            shift
             ;;
+        --follow) ;;
+        *) echo "Unknown argument: $1"; exit 2 ;;
     esac
+    shift
 done
-# Без явной команды ничего не устанавливаем, даже если передан только --container.
-if (( ! MODE_SELECTED )); then
-    echo 'Usage: sudo bash warp-pipe-proxy.sh <install|check|client-config|client-profile> [--container]'
-    exit 2
+[[ -n $MODE ]] || { python3 "$BASE/admin.py" --help; exit 2; }
+# argparse проверяет принадлежность параметров командам до любых изменений системы.
+if [[ $MODE == install ]]; then
+    for argument in "${CLI_ARGS[@]}"; do
+        case "$argument" in install|--container) ;; *) echo 'install only accepts --container'; exit 2 ;; esac
+    done
+else
+    python3 "$BASE/admin.py" "${CLI_ARGS[@]}" --validate-only
 fi
+case "$MODE" in
+    status|doctor|logs|client-profile) exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}" ;;
+esac
 # Проверяем базовое окружение до создания файлов и запуска служб.
 [[ $EUID == 0 ]] || { echo 'Run with sudo/root'; exit 1; }
 [[ -f /etc/os-release ]] || exit 1
@@ -48,11 +59,6 @@ ROOT=/etc/warp-pipe-proxy
 # Секретные ссылки выводим отдельно, до подключения общего журнала.
 if [[ $MODE == client-config ]]; then
     cat "$ROOT/clients.txt"
-    exit
-fi
-# Профиль клиента выводится без общего журнала, поскольку содержит UUID доступа.
-if [[ $MODE == client-profile ]]; then
-    python3 "$BASE/configure.py" client-profile
     exit
 fi
 command -v flock >/dev/null || { echo 'flock is required'; exit 1; }
@@ -409,6 +415,7 @@ save_installation_results() {
     install -m 600 "$STAGE/client-sing-box.json" "$ROOT/client-sing-box.json"
     touch "$ROOT/installed"
     python3 "$BASE/configure.py" summary > "$ROOT/summary.json"
+    install_cli_command
     # Все обязательные проверки завершены, последующие ошибки не откатывают рабочую установку.
     TRANSACTION=0
 }
@@ -423,7 +430,10 @@ finish_installation() {
     log "Client links (secrets): $ROOT/clients.txt; settings: $ROOT/settings.json; credentials: $ROOT/credentials.json"
     log "sing-box client profile: $ROOT/client-sing-box.json; import it on the client"
     log WARN 'For LAN access, change the client profile server address to the laptop IP and published port'
-    log 'Runtime log: journalctl -u warp-pipe-proxy'
+    log 'Next: export a profile with client-profile, import it into sing-box and enable VPN/TUN'
+    log 'Use --endpoint LAPTOP_LAN_IP --port PUBLISHED_PORT when exporting for Podman'
+    log 'Diagnostics: sudo warp-pipe-proxy status; sudo warp-pipe-proxy doctor; sudo warp-pipe-proxy logs --follow'
+    log "Allow inbound TCP $(read_setting vless_port) in the provider firewall"
     if (( CONTAINER_MODE )); then
         log WARN 'CONTAINER MODE: proxy checks passed; UFW, fail2ban and BBR were not managed'
         log 'Repeat --container when running install or check in this environment'
@@ -435,6 +445,7 @@ finish_installation() {
 
 # Вызываем этапы обычными командами, не в условиях if/&&: иначе Bash может отключить errexit внутри функций.
 run_installation() {
+    check_cli_paths
     check_installation_prerequisites
     backup_existing_configuration
     install_system_dependencies
@@ -451,6 +462,11 @@ run_installation() {
 }
 
 case "$MODE" in
-    check) check_installation ;;
+    check)
+        check_installation
+        if [[ -n $CHECK_URL ]]; then
+            python3 "$BASE/admin.py" doctor --url "$CHECK_URL"
+        fi
+        ;;
     install) run_installation ;;
 esac

@@ -39,7 +39,7 @@ def owns_port(port):
     return bool(lines) and all(re.search(r'pid=' + pid + r',', line) for line in lines)
 
 
-def probe(root):
+def probe(root, url='https://example.com', diagnostic=False):
     settings = json.loads((root / 'settings.json').read_text())
     credentials = json.loads((root / 'credentials.json').read_text())
     with tempfile.TemporaryDirectory(prefix='vps-reality-probe-') as directory:
@@ -65,12 +65,15 @@ def probe(root):
                     raise RuntimeError('Temporary VLESS client did not become ready')
                 subprocess.run([
                     'curl', '--noproxy', '', '--proxy', f'socks5h://127.0.0.1:{port}',
-                    '--fail', '--silent', '--show-error', '--max-time', '30',
-                    'https://example.com', '-o', os.devnull
+                    *([] if diagnostic else ['--fail']),
+                    '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20',
+                    '--write-out', 'HTTP %{http_code}; downloaded %{size_download} bytes\n',
+                    url, '-o', os.devnull
                 ], check=True, timeout=35)
                 if process.poll() is not None:
                     raise RuntimeError('Temporary VLESS client exited during probe')
-                print('VLESS Reality authenticated HTTPS request passed')
+                print('VLESS Reality authenticated HTTPS request passed' if not diagnostic
+                      else 'VLESS transport passed; inspect the HTTP status above')
             finally:
                 process.terminate()
                 try:
