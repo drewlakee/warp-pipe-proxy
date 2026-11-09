@@ -14,6 +14,7 @@ rollback() {
     local services_to_stop=(warp-pipe-proxy)
     if (( ! CONTAINER_MODE )); then services_to_stop+=(fail2ban); fi
     services_to_stop+=(unbound)
+    if [[ ${MODE:-} == rotate-keys ]]; then services_to_stop=(warp-pipe-proxy); fi
     for service in "${services_to_stop[@]}"; do
         systemctl stop "$service" || rollback_failed=1
     done
@@ -168,6 +169,9 @@ begin_transaction() {
     if (( ! CONTAINER_MODE )); then
         managed_paths+=(/etc/fail2ban/jail.d/warp-pipe-proxy.local /etc/ufw /etc/default/ufw)
     fi
+    if [[ ${MODE:-} == rotate-keys ]]; then
+        managed_paths=(/etc/sing-box/config.json "$ROOT/credentials.json" "$ROOT/clients.txt" "$ROOT/client-sing-box.json")
+    fi
     for path in "${managed_paths[@]}"; do
         printf '%s\n' "$path" >> "$BACKUP/paths"
         if [[ -e $path ]]; then
@@ -179,6 +183,7 @@ begin_transaction() {
     local managed_services=(unbound)
     if (( ! CONTAINER_MODE )); then managed_services+=(fail2ban); fi
     managed_services+=(sing-box warp-pipe-proxy)
+    if [[ ${MODE:-} == rotate-keys ]]; then managed_services=(warp-pipe-proxy); fi
     for service in "${managed_services[@]}"; do
         # Неактивная или отсутствующая служба — допустимое исходное состояние, а не ошибка снимка.
         state=$(systemctl is-active "$service" || true)
@@ -283,4 +288,37 @@ exec /bin/bash /usr/local/lib/warp-pipe-proxy/warp-pipe-proxy.sh "$@"
 LAUNCHER
     install -m 755 "$STAGE/warp-pipe-proxy" /usr/local/bin/warp-pipe-proxy
     log SUCCESS 'Installed command: /usr/local/bin/warp-pipe-proxy'
+}
+
+
+rotate_keys() {
+    stage 'Preparing VLESS credential rotation'
+    [[ -f $ROOT/installed && -f $ROOT/settings.json && -f $ROOT/credentials.json ]] || {
+        log ERROR 'An existing managed installation is required'
+        return 1
+    }
+    systemctl is-active --quiet warp-pipe-proxy
+    sing-box check -c /etc/sing-box/config.json
+    install -d -m 700 /var/lib/warp-pipe-proxy-installer
+    BACKUP=/var/lib/warp-pipe-proxy-installer/$RUN
+    install -d -m 700 "$BACKUP"
+    STAGE=$(mktemp -d /var/lib/warp-pipe-proxy-installer/rotate.XXXXXX)
+    python3 "$BASE/configure.py" render-rotated --root "$ROOT" --out "$STAGE"
+    sing-box check -c "$STAGE/config.json"
+    sing-box check -c "$STAGE/client-sing-box.json"
+    begin_transaction
+    stage 'Applying new VLESS credentials'
+    log WARN 'Existing client profiles will stop working after rotation'
+    install -m 600 "$STAGE/credentials.json" "$ROOT/credentials.json"
+    install -m 640 -o root -g warp-pipe-proxy "$STAGE/config.json" /etc/sing-box/config.json
+    systemctl restart warp-pipe-proxy
+    stage 'Verifying authenticated VLESS traffic'
+    python3 "$BASE/probe.py"
+    systemctl is-active --quiet warp-pipe-proxy
+    install -m 600 "$STAGE/clients.txt" "$ROOT/clients.txt"
+    install -m 600 "$STAGE/client-sing-box.json" "$ROOT/client-sing-box.json"
+    TRANSACTION=0
+    log SUCCESS 'VLESS UUID, Reality key pair and short ID rotated'
+    log "Import the updated profile on every client: $ROOT/client-sing-box.json"
+    log "Previous credentials are retained in the root-only backup: $BACKUP"
 }

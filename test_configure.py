@@ -21,6 +21,27 @@ class ConfigureTests(unittest.TestCase):
         self.credentials = {'uuid': '96051898-0bda-4891-9358-f1ef308dffab', 'socks_password': 'a'*64,
                             'short_id': 'a'*8, 'private_key': 'b'*43, 'public_key': 'c'*43}
 
+    def test_rotated_render_preserves_source_and_updates_all_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'stage'
+            module.write(root / 'settings.json', self.settings)
+            module.write(root / 'credentials.json', self.credentials)
+            before = (root / 'credentials.json').read_bytes()
+            with patch('sys.argv', ['configure.py', 'render-rotated', '--root', str(root), '--out', str(output)]), patch.object(
+                    module.subprocess, 'check_output', return_value='PrivateKey: ' + 'd'*43 + '\nPublicKey: ' + 'e'*43):
+                module.main()
+            new = json.loads((output / 'credentials.json').read_text())
+            self.assertNotEqual(new['uuid'], self.credentials['uuid'])
+            self.assertNotEqual(new['short_id'], self.credentials['short_id'])
+            self.assertEqual((root / 'credentials.json').read_bytes(), before)
+            server = json.loads((output / 'config.json').read_text())
+            client = json.loads((output / 'client-sing-box.json').read_text())
+            self.assertEqual(server['inbounds'][0]['users'][0]['uuid'], new['uuid'])
+            self.assertEqual(client['outbounds'][0]['uuid'], new['uuid'])
+            self.assertIn(new['uuid'], (output / 'clients.txt').read_text())
+            self.assertNotIn(new['private_key'], (output / 'client-sing-box.json').read_text())
+
     def test_existing_credentials_are_not_regenerated(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

@@ -16,7 +16,7 @@ while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
-        install|check|status|doctor|logs|client-config|client-profile)
+        install|check|status|doctor|logs|client-config|client-profile|rotate-keys)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
             MODE_SELECTED=1
@@ -469,4 +469,5 @@ case "$MODE" in
         fi
         ;;
     install) run_installation ;;
+    rotate-keys) rotate_keys ;;
 esac

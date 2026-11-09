@@ -93,7 +93,7 @@ def remove_legacy_socks_rules():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['init', 'render', 'get', 'summary', 'client-profile', 'remove-legacy-socks-rules'])
+    parser.add_argument('action', choices=['init', 'render', 'render-rotated', 'get', 'summary', 'client-profile', 'remove-legacy-socks-rules'])
     parser.add_argument('--root', type=Path, default=Path('/etc/warp-pipe-proxy'))
     parser.add_argument('--out', type=Path)
     parser.add_argument('--key')
@@ -118,13 +118,19 @@ def main():
     s = json.loads((root / 'settings.json').read_text())
     c = json.loads((root / 'credentials.json').read_text())
     validate(s, c)
+    if args.action == 'render-rotated':
+        output = subprocess.check_output(['sing-box', 'generate', 'reality-keypair'], text=True)
+        keys = dict(re.findall(r'(PrivateKey|PublicKey):\s*(\S+)', output))
+        c = {'uuid': str(uuid.uuid4()), 'short_id': secrets.token_hex(4),
+             'private_key': keys['PrivateKey'], 'public_key': keys['PublicKey']}
+        validate(s, c)
     if args.action == 'client-profile':
         print(json.dumps(render_client(s, c), indent=2))
     elif args.action == 'get':
         print(s[args.key])
     elif args.action == 'summary':
         print(json.dumps(s, indent=2))
-    elif args.action == 'render':
+    elif args.action in ('render', 'render-rotated'):
         args.out.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Удаление старых полей применяется установщиком только после снимка отката.
         write(args.out / 'settings.json', {k: v for k, v in s.items() if k not in ('socks_port', 'socks_user')})

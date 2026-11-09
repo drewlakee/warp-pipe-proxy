@@ -15,7 +15,7 @@ ROOT = Path('/etc/warp-pipe-proxy')
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog='warp-pipe-proxy.sh', description='Warp Pipe Proxy: install, inspect and troubleshoot VLESS Reality')
-    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'client-config', 'client-profile'])
+    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'client-config', 'client-profile', 'rotate-keys'])
     parser.add_argument('--container', action='store_true', help='Do not manage host firewall or fail2ban')
     parser.add_argument('--url', help='HTTP(S) site to compare directly and through VLESS; no redirects followed')
     parser.add_argument('--endpoint', help='Override client server IP (including private LAN IP); does not change server settings')
