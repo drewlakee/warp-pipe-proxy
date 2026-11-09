@@ -27,7 +27,17 @@
 
 ## Быстрый запуск
 
-Скопируйте **весь каталог**, включая вспомогательные скрипты:
+1) На свежей VPS с root-пользователя
+
+```bash
+git clone https://github.com/drewlakee/warp-pipe-proxy.git
+cd warp-pipe-proxy
+./warp-pipe-proxy.sh install
+warp-pipe-proxy client-qr
+```
+
+
+2) Скопируйте **весь каталог**, включая вспомогательные скрипты:
 
 ```bash
 scp -r ~/Desktop/warp-pipe-proxy root@SERVER_IP:/root/
