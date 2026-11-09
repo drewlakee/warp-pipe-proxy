@@ -2,6 +2,7 @@ import argparse
 import ipaddress
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -15,7 +16,7 @@ ROOT = Path('/etc/warp-pipe-proxy')
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog='warp-pipe-proxy.sh', description='Warp Pipe Proxy: install, inspect and troubleshoot VLESS Reality')
-    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'client-config', 'client-profile', 'rotate-keys'])
+    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'client-config', 'client-profile', 'client-qr', 'rotate-keys'])
     parser.add_argument('--container', action='store_true', help='Do not manage host firewall or fail2ban')
     parser.add_argument('--url', help='HTTP(S) site to compare directly and through VLESS; no redirects followed')
     parser.add_argument('--endpoint', help='Override client server IP (including private LAN IP); does not change server settings')
@@ -25,7 +26,7 @@ def parse_args(argv=None):
     parser.add_argument('--filter', help='Literal journal substring, e.g. destination IP or connection ID')
     parser.add_argument('--validate-only', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    for names, commands in [(('url',), ('check', 'doctor')), (('endpoint', 'port'), ('client-profile',)),
+    for names, commands in [(('url',), ('check', 'doctor')), (('endpoint', 'port'), ('client-profile', 'client-qr')),
                             (('follow', 'since', 'filter'), ('logs',))]:
         if args.command not in commands and any(getattr(args, name) not in (None, False) for name in names):
             parser.error(f'{", ".join(names)} only supported for {", ".join(commands)}')
@@ -128,10 +129,24 @@ def main():
     args = parse_args()
     if args.validate_only:
         return 0
-    if args.command == 'client-profile':
+    if args.command in ('client-profile', 'client-qr'):
         settings = json.loads((ROOT / 'settings.json').read_text())
         credentials = json.loads((ROOT / 'credentials.json').read_text())
         configure.validate(settings, credentials)
+        if args.command == 'client-qr':
+            if shutil.which('qrencode') is None:
+                print('ERROR: qrencode is missing. Install it with: sudo apt-get install qrencode', file=sys.stderr)
+                return 1
+            settings = dict(settings)
+            if args.endpoint is not None:
+                settings['public_ip'] = args.endpoint
+            if args.port is not None:
+                settings['vless_port'] = args.port
+            link = configure.render_vless_link(settings, credentials)
+            print('VLESS QR contains access credentials. Keep it private. DNS/TUN settings require the JSON profile.', file=sys.stderr)
+            result = subprocess.run(['qrencode', '-t', 'ANSIUTF8', '-m', '2'],
+                                    input=link, text=True, check=False)
+            return result.returncode
         profile = configure.render_client(settings, credentials)
         if args.endpoint is not None:
             profile['outbounds'][0]['server'] = args.endpoint

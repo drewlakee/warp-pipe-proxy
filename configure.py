@@ -91,6 +91,16 @@ def remove_legacy_socks_rules():
             subprocess.run(['ufw', '--force', 'delete', *args[1:]], check=True)
 
 
+def render_vless_link(settings, credentials):
+    host = settings['public_ip']
+    if ':' in host:
+        host = '[' + host + ']'
+    return f"vless://{credentials['uuid']}@{host}:{settings['vless_port']}?" + urlencode({
+        'encryption': 'none', 'flow': 'xtls-rprx-vision', 'security': 'reality',
+        'sni': settings['reality_host'], 'fp': 'chrome', 'pbk': credentials['public_key'],
+        'sid': credentials['short_id'], 'type': 'tcp'}) + '#vps-reality'
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['init', 'render', 'render-rotated', 'get', 'summary', 'client-profile', 'remove-legacy-socks-rules'])
@@ -152,9 +162,7 @@ def main():
   rrset-cache-size: 64m
   num-threads: 1
 ''')
-        vless = f"vless://{c['uuid']}@{s['public_ip']}:{s['vless_port']}?" + urlencode({
-            'encryption': 'none', 'flow': 'xtls-rprx-vision', 'security': 'reality', 'sni': s['reality_host'],
-            'fp': 'chrome', 'pbk': c['public_key'], 'sid': c['short_id'], 'type': 'tcp'}) + '#vps-reality'
+        vless = render_vless_link(s, c)
         write(args.out / 'clients.txt', 'VLESS Reality:\n' + vless + '\n')
 
 

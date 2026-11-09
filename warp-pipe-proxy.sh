@@ -16,7 +16,7 @@ while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
-        install|check|status|doctor|logs|client-config|client-profile|rotate-keys)
+        install|check|status|doctor|logs|client-config|client-profile|client-qr|rotate-keys)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
             MODE_SELECTED=1
@@ -41,7 +41,7 @@ else
     python3 "$BASE/admin.py" "${CLI_ARGS[@]}" --validate-only
 fi
 case "$MODE" in
-    status|doctor|logs|client-profile) exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}" ;;
+    status|doctor|logs|client-profile|client-qr) exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}" ;;
 esac
 # Проверяем базовое окружение до создания файлов и запуска служб.
 [[ $EUID == 0 ]] || { echo 'Run with sudo/root'; exit 1; }
@@ -211,7 +211,7 @@ backup_existing_configuration() {
 install_system_dependencies() {
     stage 'Installing system packages'
     apt-get update
-    local packages=(curl ca-certificates openssl python3 dnsutils iproute2 unbound dns-root-data)
+    local packages=(curl ca-certificates openssl python3 dnsutils iproute2 unbound dns-root-data qrencode)
     if (( ! CONTAINER_MODE )); then packages+=(ufw fail2ban); fi
     apt-get install -y "${packages[@]}"
     firewall_backend_check

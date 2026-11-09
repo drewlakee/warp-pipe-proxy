@@ -38,6 +38,28 @@ class AdminTests(unittest.TestCase):
             self.assertNotIn('private_key', output.getvalue())
             self.assertEqual(before, (root / 'settings.json').read_bytes())
 
+    def test_qr_uses_current_credentials_and_stdin_without_mutating_settings(self):
+        fixture = test_configure.ConfigureTests()
+        fixture.setUp()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, value in [('settings', fixture.settings), ('credentials', fixture.credentials)]:
+                (root / (name + '.json')).write_text(json.dumps(value))
+            original = (root / 'settings.json').read_bytes()
+            with patch.object(admin, 'ROOT', root), patch('sys.argv', [
+                    'admin.py', 'client-qr', '--endpoint', '2001:db8::1', '--port', '443']), patch.object(
+                    admin.shutil, 'which', return_value='/usr/bin/qrencode'), patch.object(
+                    admin.subprocess, 'run') as run, contextlib.redirect_stderr(io.StringIO()):
+                run.return_value.returncode = 0
+                self.assertEqual(admin.main(), 0)
+            link = run.call_args.kwargs['input']
+            self.assertIn('@[2001:db8::1]:443?', link)
+            self.assertIn(fixture.credentials['uuid'], link)
+            self.assertIn('pbk=' + fixture.credentials['public_key'], link)
+            self.assertNotIn(fixture.credentials['private_key'], link)
+            self.assertEqual(run.call_args.args[0], ['qrencode', '-t', 'ANSIUTF8', '-m', '2'])
+            self.assertEqual((root / 'settings.json').read_bytes(), original)
+
     def test_doctor_does_not_hide_vless_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
