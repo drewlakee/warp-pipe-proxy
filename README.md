@@ -1,5 +1,7 @@
 # Warp Pipe Proxy
 
+> **Русский** · [English](README.en.md)
+
 Установщик личного прокси VLESS Reality на Ubuntu. Трафик идёт через ваш сервер, сайты видят его IP. Установщик настраивает sing-box и создаёт ключи.
 
 ## Установка
@@ -12,8 +14,6 @@
 git clone https://github.com/drewlakee/warp-pipe-proxy.git
 cd warp-pipe-proxy
 ```
-
-> **Выберите способ установки** · [На VPS](#vps) · [В контейнере](#контейнер)
 
 ### VPS
 
