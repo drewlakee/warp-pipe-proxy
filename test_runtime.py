@@ -99,9 +99,9 @@ systemctl() {{
  *) return 0;;
  esac
 }}
+UFW_ACTIVE=no
 begin_transaction
 FIREWALL_CHANGED=1
-UFW_ACTIVE=yes
 ufw() {{ echo "FIREWALL: $*"; }}
 printf new > "{config}"
 printf new > "$ROOT/clients.txt"
@@ -120,7 +120,7 @@ exit 17
                 self.assertEqual((root / 'root' / name).read_text(), 'legacy')
             self.assertFalse((root / 'root/clients.txt').exists())
             self.assertIn('service states restored', result.stdout)
-            self.assertIn('FIREWALL: reload', result.stdout)
+            self.assertIn('FIREWALL: --force disable', result.stdout)
 
     def test_container_skips_firewall_and_bbr_commands(self):
         result = self.shell(
@@ -137,6 +137,38 @@ systemd-detect-virt() { echo UNEXPECTED; return 91; }
 """)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('UNEXPECTED', result.stdout)
+
+    def test_rollback_preserves_active_firewall_and_intervening_admin_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/').replace('/usr/local/', directory + '/usr/local/')
+            (root / 'runtime.sh').write_text(runtime)
+            rules = root / 'etc/ufw/user.rules'
+            rules.parent.mkdir(parents=True)
+            rules.write_text('original administrator policy')
+            result = subprocess.run(['bash', '-c', f'''
+set -Eeuo pipefail
+source "{root}/runtime.sh"
+ROOT="{root}/root"
+BACKUP="{root}/backup"
+UFW_ACTIVE=yes
+log() {{ echo "$*"; }}
+systemctl() {{
+    case "$1" in
+        is-active) echo inactive; return 3;;
+        is-enabled) echo disabled; return 1;;
+        *) return 0;;
+    esac
+}}
+ufw() {{ echo UNEXPECTED_FIREWALL_CHANGE; return 99; }}
+begin_transaction
+printf 'intervening administrator policy' > "{rules}"
+exit 17
+'''], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 17, result.stderr)
+            self.assertEqual(rules.read_text(), 'intervening administrator policy')
+            self.assertNotIn('UNEXPECTED_FIREWALL_CHANGE', result.stdout)
+            self.assertNotIn('/etc/ufw', (root / 'backup/paths').read_text())
 
     def test_container_does_not_require_fail2ban_service(self):
         result = self.shell('wait_services', """
@@ -197,7 +229,7 @@ exit 17
             (root / 'runtime.sh').write_text(runtime)
             source = root / 'source'
             source.mkdir()
-            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py', 'activity.py'):
+            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py', 'activity.py', 'lifecycle.py'):
                 (source / name).write_text((BASE / name).read_text())
             stage = root / 'stage'
             stage.mkdir()

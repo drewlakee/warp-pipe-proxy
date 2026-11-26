@@ -5,6 +5,7 @@ set -Eeuo pipefail
 umask 077
 # Комментарии русские, но сообщения скрипта и системных утилит — английские.
 export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
 BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MODE=''
 CONTAINER_MODE=0
@@ -13,19 +14,21 @@ MODE_SELECTED=0
 CLI_ARGS=("$@")
 CHECK_URL=''
 DEVICE=''
+BACKUP_RUN=''
 while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
-        install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke)
+        install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke|uninstall|restore)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
             MODE_SELECTED=1
             ;;
-        --url|--endpoint|--port|--since|--filter|--device)
+        --url|--endpoint|--port|--since|--filter|--device|--backup)
             [[ $# -ge 2 ]] || { echo "Missing value for $1"; exit 2; }
             if [[ $1 == --url ]]; then CHECK_URL=$2; fi
             if [[ $1 == --device ]]; then DEVICE=$2; fi
+            if [[ $1 == --backup ]]; then BACKUP_RUN=$2; fi
             shift
             ;;
         --follow) ;;
@@ -110,7 +113,14 @@ stage() {
 on_error() {
     local status=$1 line=$2
     banner "ERROR | $CURRENT_STAGE" >&2
-    log ERROR "FAILED line=$line exit=$status. See $LOG. Managed configuration will be rolled back if application has started; packages and generated credentials are retained." >&2
+    log ERROR "FAILED line=$line exit=$status. See $LOG." >&2
+    if [[ $MODE == device-revoke ]]; then
+        log ERROR 'An incomplete applied revocation leaves the proxy stopped; revoked access is not rolled back. Inspect the recovery instructions below.' >&2
+    elif [[ $MODE == uninstall ]]; then
+        log ERROR 'Uninstall preserves recovery state; rerun uninstall from the project checkout to finish an interrupted removal.' >&2
+    else
+        log ERROR 'Managed configuration will be rolled back if application has started; packages and generated credentials are retained.' >&2
+    fi
     exit "$status"
 }
 trap 'on_error "$?" "$LINENO"' ERR
@@ -148,9 +158,7 @@ check_installation_prerequisites() {
         log WARN 'Configure access restrictions on the host and publish only the required container ports'
     fi
     firewall_preflight
-    if command -v iptables >/dev/null && command -v ufw >/dev/null; then
-        firewall_backend_check
-    fi
+    firewall_backend_check
     for helper in configure.py probe.py; do
         [[ -f $BASE/$helper ]] || { log ERROR "$helper must be next to warp-pipe-proxy.sh"; exit 1; }
     done
@@ -386,29 +394,38 @@ apply_validated_configuration() {
     wait_services
 }
 
-# Сначала сохраняем SSH-доступ; существующие правила UFW не сбрасываем.
+# Существующий firewall принадлежит администратору. Правила создаём только
+# при первой настройке: отсутствие активной и сохранённой политики проверено выше.
 configure_firewall() {
     if (( CONTAINER_MODE )); then
         stage 'Skipping container firewall management'
         log WARN 'UFW is not managed in container mode; host firewall must protect published ports'
         return 0
     fi
-    local port
-    stage 'Configuring UFW firewall and opening ports'
-    log 'Applying UFW rules without resetting existing rules'
+    local port expected_ufw=${UFW_ACTIVE:-}
+    stage 'Inspecting firewall policy'
+    # Если состояние изменилось после снимка, новый запуск должен заново
+    # оценить политику. Не применяем правила с устаревшим планом отката.
+    firewall_backend_check
+    if [[ -n $expected_ufw && $expected_ufw != "$UFW_ACTIVE" ]]; then
+        log ERROR 'UFW state changed during installation; refusing to apply a stale firewall plan'
+        return 1
+    fi
+    if [[ $UFW_ACTIVE == yes ]]; then
+        log 'Existing active UFW preserved: SSH restrictions, proxy rules and default policies are unchanged'
+        log WARN "Allow inbound TCP $(read_setting vless_port) in the existing firewall policy if needed; local checks do not verify external access"
+        return 0
+    fi
+    log 'No existing firewall policy found; initializing UFW for SSH and VLESS'
     # Флаг устанавливаем до первой команды UFW, чтобы откат обработал и частичное применение.
     FIREWALL_CHANGED=1
     for port in $SSH_PORTS; do
         ufw allow "$port/tcp" comment 'warp-pipe-proxy SSH preservation'
     done
-    log 'Removing legacy installer-managed SOCKS firewall rules'
-    python3 "$BASE/configure.py" remove-legacy-socks-rules
     ufw allow "$(read_setting vless_port)/tcp" comment 'warp-pipe-proxy Reality'
-    if [[ $UFW_ACTIVE == no ]]; then
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw --force enable
-    fi
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw --force enable
 }
 
 # Сохраняем результаты только после проверок; затем отключаем откат конфигураций.
@@ -418,6 +435,9 @@ save_installation_results() {
     touch "$ROOT/installed"
     python3 "$BASE/configure.py" summary > "$ROOT/summary.json"
     install_cli_command
+    local lifecycle_args=(record)
+    if (( CONTAINER_MODE )); then lifecycle_args+=(--container); fi
+    python3 "$BASE/lifecycle.py" "${lifecycle_args[@]}"
     # Все обязательные проверки завершены, последующие ошибки не откатывают рабочую установку.
     TRANSACTION=0
 }
@@ -446,6 +466,7 @@ finish_installation() {
 
 # Вызываем этапы обычными командами, не в условиях if/&&: иначе Bash может отключить errexit внутри функций.
 run_installation() {
+    python3 "$BASE/lifecycle.py" check-install
     check_cli_paths
     check_installation_prerequisites
     backup_existing_configuration
@@ -471,4 +492,22 @@ case "$MODE" in
         ;;
     install) run_installation ;;
     rotate-keys|device-add|device-revoke) update_credentials ;;
+    uninstall)
+        stage 'Removing owned proxy components and preserving recovery state'
+        python3 "$BASE/lifecycle.py" uninstall --run "$RUN"
+        ;;
+    restore)
+        stage 'Validating the latest completed uninstall snapshot'
+        install -d -m 700 /var/lib/warp-pipe-proxy-installer
+        STAGE=$(mktemp -d /var/lib/warp-pipe-proxy-installer/restore.XXXXXX)
+        CONTAINER_MODE=$(python3 "$BASE/lifecycle.py" prepare-restore --backup "$BACKUP_RUN" --out "$STAGE")
+        [[ $CONTAINER_MODE == 0 || $CONTAINER_MODE == 1 ]] || { log ERROR 'Invalid container mode in recovery snapshot'; exit 1; }
+        # prepare-restore подтверждает совпадение сохранённых settings/credentials
+        # с последним снимком. Установка повторно использует эти же ключи;
+        # старые unit-файлы, скрипты и firewall из копий не исполняются.
+        rm -rf -- "$STAGE"
+        STAGE=''
+        MODE=install
+        run_installation
+        ;;
 esac

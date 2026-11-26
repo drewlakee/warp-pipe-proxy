@@ -9,7 +9,7 @@ BASE = Path(__file__).resolve().parent
 
 class RotationTests(unittest.TestCase):
     def test_rotation_success_and_probe_failure_rollback(self):
-        for mode, fail in product(('rotate-keys', 'device-add', 'device-revoke'), (False, True)):
+        for mode, fail in product(('rotate-keys', 'device-add'), (False, True)):
             with self.subTest(mode=mode, fail=fail), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 config = root / 'etc/warp-pipe-proxy'

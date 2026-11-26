@@ -4,6 +4,8 @@
 CONTAINER_MODE=${CONTAINER_MODE:-0}
 TRANSACTION=0
 FIREWALL_CHANGED=0
+# После начала отзыва ошибки не должны возвращать скомпрометированный UUID.
+REVOKE_FAIL_CLOSED=0
 # Путь к временным конфигам; EXIT удаляет каталог и при успехе, и при ошибке.
 STAGE=''
 # Восстановление выполняется без errexit: ошибка одного действия не должна помешать остальным.
@@ -26,6 +28,9 @@ rollback() {
     done < "$BACKUP/enabled"
     # В списке есть и ранее отсутствовавшие пути: новые файлы удаляются, прежние возвращаются из снимка.
     while IFS= read -r path; do
+        if [[ $path == /etc/ufw || $path == /etc/default/ufw ]] && (( ! FIREWALL_CHANGED )); then
+            continue
+        fi
         rm -rf -- "$path" || rollback_failed=1
         if [[ -e $BACKUP/transaction$path ]]; then
             cp -a "$BACKUP/transaction$path" "$path" || rollback_failed=1
@@ -67,8 +72,18 @@ finish() {
     # Отключаем обработчики, чтобы ошибка самого отката не вызвала его повторно.
     trap - EXIT ERR INT TERM
     set +e
-    if (( exit_status != 0 && TRANSACTION )); then
-        rollback
+    if (( exit_status != 0 )); then
+        if (( REVOKE_FAIL_CLOSED )); then
+            systemctl stop warp-pipe-proxy || log ERROR 'Could not stop the proxy after an incomplete revocation; stop it manually immediately'
+            systemctl disable warp-pipe-proxy || log ERROR 'Could not disable proxy autostart after an incomplete revocation'
+            rm -f -- "$ROOT/credentials.json.tmp" /etc/sing-box/config.json.tmp
+            if systemctl is-active --quiet warp-pipe-proxy; then
+                log ERROR 'Proxy is still active; revocation is NOT guaranteed'
+            fi
+            log ERROR "Revocation did not finish. Old credentials were NOT restored. The proxy was requested to stop and disable; inspect $BACKUP/revocation before recovering. Do not restore the pre-revocation credentials."
+        elif (( TRANSACTION )); then
+            rollback
+        fi
     fi
     if [[ -n $STAGE && -d $STAGE ]]; then
         rm -rf -- "$STAGE"
@@ -96,19 +111,61 @@ firewall_preflight() {
     fi
 }
 
+# Не запускаем второй firewall поверх чужой политики. Пустые таблицы с ACCEPT
+# допустимы: некоторые средства просмотра создают их даже без настроенных правил.
+assert_no_other_firewall() {
+    local tool rules
+    for tool in iptables-save ip6tables-save; do
+        if ! command -v "$tool" >/dev/null; then continue; fi
+        rules=$("$tool")
+        if ! awk '
+            /^-A / { exit 1 }
+            /^:/ && $2 != "ACCEPT" { exit 1 }
+        ' <<< "$rules"; then
+            log ERROR "Existing $tool policy detected while UFW is inactive; refusing to enable a competing firewall"
+            return 1
+        fi
+    done
+    if command -v nft >/dev/null; then
+        rules=$(nft -j list ruleset)
+        if ! python3 -c '
+import json, sys
+entries = json.load(sys.stdin)["nftables"]
+for entry in entries:
+    if any(key in entry for key in ("rule", "set", "map", "flowtable")):
+        sys.exit(1)
+    chain = entry.get("chain")
+    if chain is not None and ("hook" not in chain or chain.get("policy", "accept") != "accept"):
+        sys.exit(1)
+' <<< "$rules"; then
+            log ERROR 'Existing or unreadable nftables policy detected while UFW is inactive; refusing to enable a competing firewall'
+            return 1
+        fi
+    fi
+}
+
 # Читаем правила без изменения firewall и запоминаем его состояние для возможного отката.
 firewall_backend_check() {
     if (( CONTAINER_MODE )); then return 0; fi
-    iptables -w 5 -S >/dev/null
-    if [[ -e /proc/net/if_inet6 ]] && grep -q '^IPV6=yes' /etc/default/ufw; then
-        ip6tables -w 5 -S >/dev/null
-    fi
     UFW_ACTIVE=no
-    local firewall_status
-    firewall_status=$(LC_ALL=C ufw status)
-    if grep -q '^Status: active' <<< "$firewall_status"; then
-        UFW_ACTIVE=yes
+    local firewall_status rules
+    if command -v ufw >/dev/null; then
+        firewall_status=$(LC_ALL=C ufw status)
+        if grep -q '^Status: active' <<< "$firewall_status"; then
+            UFW_ACTIVE=yes
+            return 0
+        fi
+        if ! grep -q '^Status: inactive' <<< "$firewall_status"; then
+            log ERROR 'Cannot determine UFW state; refusing to change firewall rules'
+            return 1
+        fi
+        rules=$(LC_ALL=C ufw show added)
+        if grep -q '^ufw ' <<< "$rules"; then
+            log ERROR 'UFW is disabled but has saved user rules; refusing to activate or modify an existing policy'
+            return 1
+        fi
     fi
+    assert_no_other_firewall
 }
 
 # Default-deny может отключить чужую службу: перед включением UFW проверяем оба протокола.
@@ -116,14 +173,15 @@ firewall_backend_check() {
 protect_listeners() {
     if (( CONTAINER_MODE )); then return 0; fi
     [[ $UFW_ACTIVE == no ]] || return 0
-    local protocol listeners address port allowed
+    local protocol listeners listener address port allowed owner state receive send peer
     for protocol in tcp udp; do
         if [[ $protocol == tcp ]]; then
             listeners=$(ss -H -ltn)
         else
-            listeners=$(ss -H -lun)
+            listeners=$(ss -H -lunp)
         fi
-        while read -r address; do
+        while IFS= read -r listener; do
+            read -r state receive send address peer owner <<< "$listener"
             [[ -n $address ]] || continue
             # Loopback недоступен извне и не требует входящего правила UFW.
             case "$address" in 127.*|\[::1\]:*|::1:*) continue ;; esac
@@ -131,6 +189,12 @@ protect_listeners() {
 
             allowed=no
             if [[ $protocol == tcp ]] && grep -qx "$port" <<< "$SSH_PORTS"; then
+                allowed=yes
+            fi
+            # DHCP-клиент — часть сетевой настройки хоста, а не публичная служба.
+            # Проверяем владельца сокета, чтобы не пропустить произвольный UDP/68.
+            if [[ $protocol == udp && ( $port == 68 || $port == 546 ) &&
+                  $owner =~ \"(systemd-networkd?|dhclient|dhcpcd|NetworkManager)\" ]]; then
                 allowed=yes
             fi
             if [[ $protocol == tcp && -f $ROOT/managed && -f /etc/sing-box/config.json ]]; then
@@ -143,7 +207,7 @@ protect_listeners() {
                 log ERROR "Unmanaged $protocol listener $address: refusing to enable default-deny UFW"
                 return 1
             fi
-        done < <(awk '{print $4}' <<< "$listeners")
+        done <<< "$listeners"
     done
 }
 
@@ -164,13 +228,17 @@ begin_transaction() {
         "$ROOT/client-sing-box.json"
         "$ROOT/summary.json"
         "$ROOT/installed"
+        "$ROOT/ownership.json"
+        "$ROOT/uninstalled.json"
+        "$ROOT/revocation-pending.json"
     )
     # Откат не должен менять firewall и fail2ban, которыми этот запуск не управляет.
     if (( ! CONTAINER_MODE )); then
-        managed_paths+=(/etc/fail2ban/jail.d/warp-pipe-proxy.local /etc/ufw /etc/default/ufw)
+        managed_paths+=(/etc/fail2ban/jail.d/warp-pipe-proxy.local)
+        if [[ ${UFW_ACTIVE:-} == no ]]; then managed_paths+=(/etc/ufw /etc/default/ufw); fi
     fi
     if [[ ${MODE:-} == rotate-keys || ${MODE:-} == device-* ]]; then
-        managed_paths=(/etc/sing-box/config.json "$ROOT/credentials.json" "$ROOT/clients.txt" "$ROOT/client-sing-box.json")
+        managed_paths=(/etc/sing-box/config.json "$ROOT/credentials.json" "$ROOT/clients.txt" "$ROOT/client-sing-box.json" "$ROOT/ownership.json" "$ROOT/revocation-pending.json")
     fi
     for path in "${managed_paths[@]}"; do
         printf '%s\n' "$path" >> "$BACKUP/paths"
@@ -272,7 +340,7 @@ install_cli_command() {
     local file bundle=/usr/local/lib/warp-pipe-proxy
     check_cli_paths
     install -d -m 755 "$STAGE/cli"
-    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py activity.py; do
+    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py activity.py lifecycle.py; do
         install -m 644 "$BASE/$file" "$STAGE/cli/$file"
     done
     install -d -m 755 /usr/local/bin "$bundle"
@@ -304,12 +372,20 @@ save_default_exports() {
 
 update_credentials() {
     stage "Preparing credential change: $MODE"
+    if [[ -e $ROOT/revocation-pending.json || -L $ROOT/revocation-pending.json ]]; then
+        log ERROR 'An earlier revocation is incomplete; recover its validated credentials and rerun install before changing devices'
+        return 1
+    fi
     [[ -f $ROOT/installed && -f $ROOT/settings.json && -f $ROOT/credentials.json ]] || {
         log ERROR 'An existing managed installation is required'
         return 1
     }
-    systemctl is-active --quiet warp-pipe-proxy
-    sing-box check -c /etc/sing-box/config.json
+    # Отзыв разрешён и при остановленном прокси или повреждённом рабочем конфиге:
+    # источником истины служат credentials, а новый конфиг проверяется ниже.
+    if [[ $MODE != device-revoke ]]; then
+        systemctl is-active --quiet warp-pipe-proxy
+        sing-box check -c /etc/sing-box/config.json
+    fi
     install -d -m 700 /var/lib/warp-pipe-proxy-installer
     BACKUP=/var/lib/warp-pipe-proxy-installer/$RUN
     install -d -m 700 "$BACKUP"
@@ -321,6 +397,10 @@ update_credentials() {
     if [[ -f $STAGE/client-sing-box.json ]]; then sing-box check -c "$STAGE/client-sing-box.json"; fi
     begin_transaction
     stage "Applying credential change: $MODE"
+    if [[ $MODE == device-revoke ]]; then
+        apply_revocation
+        return
+    fi
     install -m 600 "$STAGE/credentials.json" "$ROOT/credentials.json"
     install -m 640 -o root -g warp-pipe-proxy "$STAGE/config.json" /etc/sing-box/config.json
     systemctl restart warp-pipe-proxy
@@ -328,8 +408,53 @@ update_credentials() {
     python3 "$BASE/probe.py"
     systemctl is-active --quiet warp-pipe-proxy
     save_default_exports
+    python3 "$BASE/lifecycle.py" record-config
     TRANSACTION=0
     log SUCCESS "Credential change completed: $MODE"
     if [[ $MODE == rotate-keys ]]; then log 'Export and import new profiles on every active device'; fi
     log "Previous credentials are retained in the root-only backup: $BACKUP"
+}
+
+
+# Отзыв фиксируется по локальному состоянию. Внешняя проверка не может вернуть
+# удалённый доступ. При сбое записи/запуска EXIT оставляет прокси выключенным.
+apply_revocation() {
+    local was_active=0 was_enabled
+    if systemctl is-active --quiet warp-pipe-proxy; then was_active=1; fi
+    was_enabled=$(systemctl is-enabled warp-pipe-proxy 2>/dev/null || true)
+    # Сохраняем проверенный результат отдельно от старого снимка: даже при
+    # частичной записи файлов администратор может завершить отзыв без старых UUID.
+    cp -a "$STAGE" "$BACKUP/revocation"
+    REVOKE_FAIL_CLOSED=1
+    TRANSACTION=0
+    python3 "$BASE/lifecycle.py" prepare-revoke --run "$RUN"
+    systemctl stop warp-pipe-proxy
+    systemctl disable warp-pipe-proxy
+    # credentials — источник истины для восстановления. Атомарная замена
+    # исключает повреждение файла при неполной записи; конфиг меняется вторым.
+    install -m 600 "$STAGE/credentials.json" "$ROOT/credentials.json.tmp"
+    mv -f -- "$ROOT/credentials.json.tmp" "$ROOT/credentials.json"
+    install -m 640 -o root -g warp-pipe-proxy "$STAGE/config.json" /etc/sing-box/config.json.tmp
+    mv -f -- /etc/sing-box/config.json.tmp /etc/sing-box/config.json
+    save_default_exports
+    if (( was_active )); then
+        systemctl restart warp-pipe-proxy
+        systemctl is-active --quiet warp-pipe-proxy
+    fi
+    case "$was_enabled" in
+        enabled) systemctl enable warp-pipe-proxy ;;
+        enabled-runtime) systemctl enable --runtime warp-pipe-proxy ;;
+    esac
+    python3 "$BASE/lifecycle.py" record-config
+    REVOKE_FAIL_CLOSED=0
+    log SUCCESS "Credential change completed: $MODE"
+    log "Validated revoked configuration retained in the root-only backup: $BACKUP/revocation"
+    if (( ! was_active )); then
+        log 'Proxy was inactive and remains stopped; external connectivity was not tested'
+        return 0
+    fi
+    stage 'Checking connectivity after committed revocation (diagnostic only)'
+    if ! python3 "$BASE/probe.py"; then
+        log WARN 'Device remains revoked. External connectivity check failed; inspect services and run doctor. No credentials were rolled back.'
+    fi
 }

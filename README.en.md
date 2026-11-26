@@ -13,7 +13,7 @@ On first install, the installer detects the public IPv4 address and selects a Re
 | Proxy | Configures sing-box with VLESS Reality on `0.0.0.0:10443/TCP`. The `warp-pipe-proxy` service runs as a dedicated system user and starts at boot. |
 | DNS | The server resolves names through Unbound on `127.0.0.1:5353`. The full client JSON profile sends DNS over HTTPS to `1.1.1.1` through the proxy. |
 | Keys and access | Generates a Reality key pair, a short ID and a separate UUID for the local health check. A fresh installation starts with an empty device list. It stores credentials in `/etc/warp-pipe-proxy/credentials.json` with mode `0600`. Client access to internal addresses is blocked by default. |
-| SSH and networking on a VPS | Opens the proxy port and SSH TCP ports in UFW. Fail2ban bans a source for one hour after five failed SSH logins in ten minutes. Enables TCP BBR when the kernel supports it. With `--container`, the installer skips UFW, fail2ban and BBR. |
+| SSH and networking on a VPS | Preserves an already active UFW policy. When no firewall policy exists, allows the proxy and SSH TCP ports, then enables UFW. Fail2ban bans a source for one hour after five failed SSH logins in ten minutes. Enables TCP BBR when the kernel supports it. With `--container`, the installer skips UFW, fail2ban and BBR. |
 | Checks and recovery | Checks local DNS and makes an HTTPS request through VLESS. Installer logs are in `/var/log/warp-pipe-proxy-installer/` and backups in `/var/lib/warp-pipe-proxy-installer/`. If applying changes fails, the installer attempts to restore the managed files and services. |
 
 ## Installation
@@ -58,7 +58,13 @@ sudo ./warp-pipe-proxy.sh install
 
 </details>
 
-The installer reads the SSH ports from the `sshd` configuration and adds a UFW rule allowing connections from any IP to each port. It also adds these rules when UFW is already active, including when SSH was previously allowed only from your IP.
+The installer inspects the firewall automatically; no additional options are needed.
+
+- **UFW is already active:** all rules and default policies are preserved, including source restrictions on SSH. No proxy allowance is added either: allow TCP 10443 in the existing policy if needed. Local installation checks do not establish that this port is reachable externally.
+- **No firewall policy exists:** the installer reads ports from `sshd`, permits SSH and the proxy, then enables UFW with other inbound traffic denied. It checks existing listeners first and recognizes system DHCP clients separately.
+- **UFW is disabled but has saved user rules, or another iptables/nftables policy is detected:** installation stops before applying configuration and explains the conflict. Review the existing policy yourself; the installer neither activates it nor layers another firewall over it.
+
+Reinstallation preserves an active UFW policy even when this project originally initialized it. If you change the proxy port, update its allowance in your policy yourself.
 
 ### Container
 
@@ -201,7 +207,11 @@ After a successful rollback, the previous profiles work again. If you see `ROLLB
 
 By default, `activity` shows the last request and the connection request count for each profile in the past hour, using the available journal. The summary includes revoked and idle profiles and excludes internal `@probe` checks. Use `--device` to see the UTC time, protocol and destination supplied by that client. One site can generate several requests. The live view starts with new events. Add `--since` to replay history first.
 
-To remove one device, use `device-revoke`. The service restarts and the other devices can reconnect with their existing profiles. `status` checks the services and port locally. Test external reachability from a client device.
+To remove one device, use `device-revoke`. A running service restarts and other devices can reconnect with their existing profiles. If the service is already stopped, revocation is applied without starting it. `status` checks the services and port locally. Test external reachability from a client device.
+
+**Revocation commits after local configuration validation and application.** Failure of the subsequent external HTTPS request produces a warning, but the device stays revoked and the command succeeds. Device addition and key rotation still roll back when their mandatory checks fail.
+
+If writing the revoked configuration or starting the service fails, the command returns an error and leaves the proxy stopped with autostart disabled. Old access is not automatically restored. The validated state without the revoked device remains in `/var/lib/warp-pipe-proxy-installer/<RUN>/revocation/`, and `/etc/warp-pipe-proxy/revocation-pending.json` records the incomplete revocation. If `credentials.json` was already replaced, reinstalling regenerates the configuration from those current revoked credentials. If writing credentials itself failed, installation refuses to start the proxy with old keys: first restore **the validated `revocation/credentials.json` from the indicated run** with mode `0600`, then reinstall. Do not use the pre-revocation backup. Further device changes, `uninstall` and `restore` are blocked until recovery completes. Inspect the failure in the log first; do not remove the pending marker manually. The uninstall recovery command below does not accept these intermediate snapshots.
 
 ## Settings and upgrades
 
@@ -223,3 +233,33 @@ $ sudo warp-pipe-proxy install
 This example shows a checkout that is already up to date. After downloading a new version, run the installer from the checkout as shown above. `sudo warp-pipe-proxy install` reapplies the version already installed.
 
 </details>
+
+## Uninstall and restore
+
+For an older installation, update the checkout and successfully reapply this installer version once before uninstalling. This creates `/etc/warp-pipe-proxy/ownership.json` with hashes of files owned by the project. Automated removal refuses to guess ownership without it. To stop the server immediately without upgrading, use `sudo systemctl disable --now warp-pipe-proxy`; the keys remain intact.
+
+```bash
+sudo warp-pipe-proxy uninstall
+```
+
+The command first verifies ownership and archives current settings and credentials in a separate root-only snapshot. It then stops and disables the proxy service and removes its unit, generated `/etc/sing-box/config.json`, installed command and supporting code. A manually edited managed file aborts removal before the service is stopped: preserve your changes and review the conflict. Output includes the recovery snapshot identifier `<RUN>`.
+
+**Retained:** the private `/etc/warp-pipe-proxy/` directory with keys and recovery state, logs and backups, system packages and service account, Unbound and fail2ban with their configuration, BBR, and every UFW rule, including SSH and proxy allowances. Removing the proxy does not return the whole OS to its pre-install state. A retained port allowance does not create a listening service; review shared host policy separately before cleaning it up.
+
+If removal is interrupted, resume it from the saved checkout:
+
+```bash
+sudo ./warp-pipe-proxy.sh uninstall
+```
+
+Removal resumes from its saved state. Installation and restore refuse to proceed until removal finishes. Repeating an already completed uninstall is safe and reports the same snapshot.
+
+To restore, use a trusted checkout of the same or a compatible newer version and the exact identifier printed by uninstall, for example:
+
+```bash
+sudo ./warp-pipe-proxy.sh restore --backup 20261126T120000Z-1234
+```
+
+Only **the latest completed uninstall snapshot on this server** is accepted. The command checks hashes, file permissions, absence of a new installation, and that retained settings/credentials still match the snapshot. Older transaction backups, interrupted removal and credentials changed after uninstall are rejected. This prevents accidental revival of previously revoked devices. This snapshot supports recovery from removal on the same server; recovery after complete disk loss needs a separate backup of the server state.
+
+Restore regenerates configuration with current code, runs normal installation checks and reuses retained keys. It does not replay archived scripts, units or firewall state. Container mode is read from the snapshot, so `restore` does not take `--container`. After success, previously active profiles work again, revoked devices remain revoked, and the consumed uninstall snapshot is no longer eligible for automatic restore. Check external reachability from a client device.
