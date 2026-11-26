@@ -1,5 +1,9 @@
 name: Proxy checks
-on: [pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 
@@ -29,9 +33,37 @@ jobs:
           sudo iptables -w -I FORWARD -o "$bridge" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
       - name: Exercise the installer and proxy from outside the VM
         run: sudo env PATH="$PATH" bash tests/ubuntu-vm.sh
+      - name: Publish the verified Ubuntu VM dependency inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-environment-ubuntu24.04-amd64
+          path: artifacts/tested-environment.json
+          if-no-files-found: error
       - name: Show runner forwarding state on failure
         if: failure()
         run: |
           ip -4 route
           sudo iptables -w -nvL FORWARD
           sudo lxc network list
+
+  release:
+    needs: [unit, ubuntu-vm]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tested-environment-ubuntu24.04-amd64
+          path: artifacts
+      - name: Publish the tested release without replacing existing tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tests/publish_release.sh

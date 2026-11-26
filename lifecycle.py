@@ -20,9 +20,11 @@ UNIT = '/etc/systemd/system/warp-pipe-proxy.service'
 LAUNCHER = '/usr/local/bin/warp-pipe-proxy'
 BUNDLE = '/usr/local/lib/warp-pipe-proxy'
 BUNDLE_FILES = ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py',
-                'probe.py', 'admin.py', 'activity.py', 'lifecycle.py', 'uninstall_firewall.py', '.managed')
+                'probe.py', 'admin.py', 'activity.py', 'lifecycle.py', 'uninstall_firewall.py',
+                'release.py', 'VERSION', 'dependencies.lock.json', '.managed')
 OWNED_FILES = (CONFIG, UNIT, LAUNCHER, *(BUNDLE + '/' + name for name in BUNDLE_FILES))
-LEGACY_FILES = tuple(name for name in OWNED_FILES if not name.endswith('/uninstall_firewall.py'))
+V2_FILES = tuple(name for name in OWNED_FILES if Path(name).name not in ('release.py', 'VERSION', 'dependencies.lock.json'))
+LEGACY_FILES = tuple(name for name in V2_FILES if not name.endswith('/uninstall_firewall.py'))
 UNBOUND = '/etc/unbound/unbound.conf.d/warp-pipe-proxy.conf'
 FAIL2BAN = '/etc/fail2ban/jail.d/warp-pipe-proxy.local'
 BBR_FILES = ('/etc/sysctl.d/90-warp-pipe-proxy.conf', '/etc/modules-load.d/warp-pipe-proxy.conf')
@@ -153,8 +155,9 @@ class Lifecycle:
 
     def validate_manifest(self, value, require_core=True):
         files = value.get('files') if isinstance(value, dict) else None
-        required = OWNED_FILES if isinstance(value, dict) and value.get('version') == 2 else LEGACY_FILES
-        if (not isinstance(value, dict) or value.get('version') not in (1, 2) or type(value.get('container')) is not bool
+        version = value.get('version') if isinstance(value, dict) else None
+        required = OWNED_FILES if version == 3 else V2_FILES if version == 2 else LEGACY_FILES
+        if (not isinstance(value, dict) or version not in (1, 2, 3) or type(value.get('container')) is not bool
                 or not isinstance(files, dict) or not set(files).issubset(ALL_FILES)
                 or (require_core and not set(required).issubset(files))
                 or not all(isinstance(h, str) and re.fullmatch(r'[0-9a-f]{64}', h) for h in files.values())):
@@ -185,7 +188,7 @@ class Lifecycle:
         self.read_file(self.root / 'installed', private=True)
         self.bundle_cache()
         previous = self.read_manifest()['files'] if self.present(self.root / 'ownership.json') else {}
-        manifest = {'version': 2, 'container': bool(container), 'files': {
+        manifest = {'version': 3, 'container': bool(container), 'files': {
             name: digest(self.read_file(self.target(name))) for name in OWNED_FILES}}
         # Shared package files are never recorded; these paths are specific to this project.
         for name in HOST_FILES:
@@ -209,7 +212,6 @@ class Lifecycle:
         manifest = self.read_manifest()
         if manifest['container']:
             return
-        manifest['version'] = 2
         for name in BBR_FILES:
             path = self.target(name)
             manifest['files'][name] = digest(self.read_file(path))
@@ -393,7 +395,7 @@ class Lifecycle:
                         raise ValueError(f'No ownership manifest for {name}; review the file before uninstall')
                 if not any(self.present(directory) for directory in self.project_directories()):
                     return False
-                manifest = {'version': 2, 'container': False, 'files': {}}
+                manifest = {'version': 3, 'container': False, 'files': {}}
             pending = self.root / 'revocation-pending.json'
             revoked_config = self.present(pending)
             if revoked_config:

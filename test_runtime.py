@@ -300,7 +300,7 @@ exit 17
             (root / 'runtime.sh').write_text(runtime)
             source = root / 'source'
             source.mkdir()
-            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py', 'activity.py', 'lifecycle.py', 'uninstall_firewall.py'):
+            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py', 'activity.py', 'lifecycle.py', 'uninstall_firewall.py', 'release.py', 'VERSION', 'dependencies.lock.json'):
                 (source / name).write_text((BASE / name).read_text())
             stage = root / 'stage'
             stage.mkdir()
@@ -313,12 +313,16 @@ log() {{ :; }}
 install_cli_command
 rm -rf "$BASE"
 "{root}/usr/local/bin/warp-pipe-proxy" --help
+"{root}/usr/local/bin/warp-pipe-proxy" --version
 BASE="{root}/usr/local/lib/warp-pipe-proxy"
 install_cli_command
 "{root}/usr/local/bin/warp-pipe-proxy" --help
+"{root}/usr/local/bin/warp-pipe-proxy" --version
 '''], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('doctor', result.stdout)
+            version = (BASE / 'VERSION').read_text().strip()
+            self.assertEqual(result.stdout.count('warp-pipe-proxy ' + version), 2)
 
     def test_cli_refuses_unmanaged_paths(self):
         with tempfile.TemporaryDirectory() as directory:

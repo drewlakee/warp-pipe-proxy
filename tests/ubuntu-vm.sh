@@ -21,6 +21,25 @@ lxc init ubuntu:24.04 "$other"
 created+=("$other")
 lxc start "$other"
 guest() { lxc exec "$name" -- "$@"; }
+assert_purged() {
+    guest python3 - <<'PY'
+from pathlib import Path
+paths = (
+    '/etc/warp-pipe-proxy', '/etc/sing-box/config.json',
+    '/etc/systemd/system/warp-pipe-proxy.service',
+    '/usr/local/bin/warp-pipe-proxy', '/usr/local/lib/warp-pipe-proxy',
+    '/var/lib/warp-pipe-proxy', '/var/lib/warp-pipe-proxy-installer',
+    '/var/log/warp-pipe-proxy-installer', '/var/lib/warp-pipe-proxy-uninstalling.json',
+    '/etc/unbound/unbound.conf.d/warp-pipe-proxy.conf',
+    '/etc/fail2ban/jail.d/warp-pipe-proxy.local',
+    '/etc/sysctl.d/90-warp-pipe-proxy.conf', '/etc/modules-load.d/warp-pipe-proxy.conf',
+    '/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources',
+)
+remaining = [name for name in paths if Path(name).exists() or Path(name).is_symlink()]
+if remaining:
+    raise SystemExit('Unexpected project files: ' + ', '.join(remaining))
+PY
+}
 for instance in "$name" "$other"; do
     for _ in {1..90}; do
         if lxc exec "$instance" -- true 2>/dev/null; then break; fi
@@ -28,6 +47,8 @@ for instance in "$name" "$other"; do
     done
     lxc exec "$instance" -- cloud-init status --wait
 done
+# The release validation currently covers this guest OS and architecture only.
+guest bash -c '. /etc/os-release; [[ $ID == ubuntu && $VERSION_ID == 24.04 && $(dpkg --print-architecture) == amd64 ]]'
 guest env DEBIAN_FRONTEND=noninteractive apt-get --error-on=any update
 guest env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ufw
 guest systemctl start ssh
@@ -50,9 +71,80 @@ guest ufw status | grep -q '^Status: inactive'
 ssh_check
 
 guest mkdir -p /root/project
-tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py activity.py probe.py lifecycle.py uninstall_firewall.py | guest tar -xf - -C /root/project
+tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py activity.py probe.py lifecycle.py uninstall_firewall.py \
+    VERSION dependencies.lock.json release.py tests/dependency_inventory.py | guest tar -xf - -C /root/project
 install_proxy() { guest bash /root/project/warp-pipe-proxy.sh install; }
+# A shadowing manual binary must be rejected before APT, logs, backups, or
+# configuration changes. Never replace the real system binary for this test.
+assert_purged
+guest bash -c '! command -v sing-box >/dev/null'
+guest tee /usr/local/bin/sing-box >/dev/null <<'SH'
+#!/bin/sh
+touch /run/warp-unexpected-sing-box-execution
+printf '%s\n' 'sing-box version 0.0.0'
+SH
+guest chmod 755 /usr/local/bin/sing-box
+preflight_snapshot() {
+    guest python3 - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import stat
+
+paths = (
+    '/etc/apt', '/etc/ufw', '/etc/default/ufw', '/etc/ssh',
+    '/etc/unbound', '/etc/fail2ban', '/var/lib/dpkg/status',
+    '/proc/sys/net/core/default_qdisc', '/proc/sys/net/ipv4/tcp_congestion_control',
+)
+result = {}
+def record(path):
+    if not path.exists() and not path.is_symlink():
+        result[str(path)] = None
+        return
+    info = path.lstat()
+    value = {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
+    if path.is_symlink():
+        value['link'] = str(path.readlink())
+    elif path.is_file():
+        value['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+    elif path.is_dir():
+        for child in sorted(path.iterdir()):
+            record(child)
+    result[str(path)] = value
+for name in paths:
+    record(Path(name))
+print(json.dumps(result, sort_keys=True))
+PY
+}
+preflight_snapshot > "$tmp/preflight-before.json"
+guest ufw show added > "$tmp/preflight-rules"
+if install_proxy > "$tmp/preflight-refusal.log" 2>&1; then
+    echo 'A shadowing sing-box binary was accepted unexpectedly' >&2
+    exit 1
+fi
+grep -Fq 'unmanaged or manual sing-box binary' "$tmp/preflight-refusal.log"
+guest test ! -e /run/warp-unexpected-sing-box-execution
+assert_purged
+preflight_snapshot > "$tmp/preflight-after.json"
+diff "$tmp/preflight-before.json" "$tmp/preflight-after.json"
+guest ufw show added | diff - "$tmp/preflight-rules"
+guest rm /usr/local/bin/sing-box
 install_proxy
+guest python3 -B /root/project/release.py verify
+[[ $(guest warp-pipe-proxy --version) == 'warp-pipe-proxy 0.1.0' ]]
+install -d -m 755 artifacts
+guest python3 -B /root/project/tests/dependency_inventory.py --lock /root/project/dependencies.lock.json \
+    > artifacts/tested-environment.json
+python3 - <<'PY'
+import json
+from pathlib import Path
+import subprocess
+path = Path('artifacts/tested-environment.json')
+inventory = json.loads(path.read_text())
+inventory['source_commit'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + '\n')
+PY
+chmod 644 artifacts/tested-environment.json
 guest cat /usr/bin/sing-box > "$tmp/sing-box"
 chmod 700 "$tmp/sing-box"
 export PATH="$tmp:$PATH"
@@ -209,25 +301,6 @@ request laptop https://example.com
 old_key=$(guest python3 -c 'import json; print(json.load(open("/etc/warp-pipe-proxy/credentials.json"))["public_key"])')
 guest sha256sum /etc/unbound/unbound.conf.d/fixture.conf > "$tmp/foreign-config"
 guest warp-pipe-proxy uninstall
-assert_purged() {
-    guest python3 - <<'PY'
-from pathlib import Path
-paths = (
-    '/etc/warp-pipe-proxy', '/etc/sing-box/config.json',
-    '/etc/systemd/system/warp-pipe-proxy.service',
-    '/usr/local/bin/warp-pipe-proxy', '/usr/local/lib/warp-pipe-proxy',
-    '/var/lib/warp-pipe-proxy', '/var/lib/warp-pipe-proxy-installer',
-    '/var/log/warp-pipe-proxy-installer', '/var/lib/warp-pipe-proxy-uninstalling.json',
-    '/etc/unbound/unbound.conf.d/warp-pipe-proxy.conf',
-    '/etc/fail2ban/jail.d/warp-pipe-proxy.local',
-    '/etc/sysctl.d/90-warp-pipe-proxy.conf', '/etc/modules-load.d/warp-pipe-proxy.conf',
-    '/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources',
-)
-remaining = [name for name in paths if Path(name).exists() or Path(name).is_symlink()]
-if remaining:
-    raise SystemExit('Uninstall left project files: ' + ', '.join(remaining))
-PY
-}
 assert_purged
 guest sha256sum --check < "$tmp/foreign-config"
 grep -v "comment 'warp-pipe-proxy Reality'" "$tmp/rules" > "$tmp/retained-rules"
@@ -262,4 +335,11 @@ request phone https://example.com deny
 guest warp-pipe-proxy device-add --device fresh
 export_profile fresh
 request fresh https://example.com
-echo 'PASS: firewall initialization/preservation, external VLESS, reboot, revocation during outage, rollback, permanent uninstall and fresh reinstall'
+echo 'PASS: release dependency checks, firewall initialization/preservation, external VLESS, reboot, revocation during outage, rollback, permanent uninstall and fresh reinstall'
+python3 - <<'PY'
+import json
+from pathlib import Path
+inventory = json.loads(Path('artifacts/tested-environment.json').read_text())
+summary = {key: value for key, value in inventory.items() if key not in ('packages', 'lock')}
+print('RELEASE_DEPENDENCY_INVENTORY=' + json.dumps(summary, sort_keys=True, separators=(',', ':')))
+PY
