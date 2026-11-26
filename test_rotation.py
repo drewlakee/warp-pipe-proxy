@@ -1,4 +1,4 @@
-import os
+from itertools import product
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,8 +9,8 @@ BASE = Path(__file__).resolve().parent
 
 class RotationTests(unittest.TestCase):
     def test_rotation_success_and_probe_failure_rollback(self):
-        for fail in (False, True):
-            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+        for mode, fail in product(('rotate-keys', 'device-add', 'device-revoke'), (False, True)):
+            with self.subTest(mode=mode, fail=fail), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 config = root / 'etc/warp-pipe-proxy'
                 config.mkdir(parents=True)
@@ -31,7 +31,8 @@ umask 077
 source "{script}"
 ROOT="{config}"
 BASE="{BASE}"
-MODE=rotate-keys
+MODE={mode}
+DEVICE=phone
 RUN=test
 log() {{ echo "$*"; }}
 stage() {{ echo "$*"; }}
@@ -53,7 +54,7 @@ python3() {{
    echo new > "$STAGE/$name"
  done
 }}
-rotate_keys
+update_credentials
 '''], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 1 if fail else 0, result.stderr)
                 for path in paths:

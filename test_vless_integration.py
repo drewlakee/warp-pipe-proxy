@@ -18,6 +18,7 @@ def main():
         settings = json.loads((root / 'settings.json').read_text())
         credentials = json.loads((root / 'credentials.json').read_text())
         config = configure.render(settings, credentials)
+        config['inbounds'][0]['listen'] = '127.0.0.1'
         config['dns']['servers'] = [{'type': 'local', 'tag': 'unbound'}]
         path = root / 'server.json'
         path.write_text(json.dumps(config))

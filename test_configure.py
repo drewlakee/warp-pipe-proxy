@@ -32,14 +32,14 @@ class ConfigureTests(unittest.TestCase):
                     module.subprocess, 'check_output', return_value='PrivateKey: ' + 'd'*43 + '\nPublicKey: ' + 'e'*43):
                 module.main()
             new = json.loads((output / 'credentials.json').read_text())
-            self.assertNotEqual(new['uuid'], self.credentials['uuid'])
+            self.assertNotEqual(new['devices']['default'], self.credentials['uuid'])
             self.assertNotEqual(new['short_id'], self.credentials['short_id'])
             self.assertEqual((root / 'credentials.json').read_bytes(), before)
             server = json.loads((output / 'config.json').read_text())
             client = json.loads((output / 'client-sing-box.json').read_text())
-            self.assertEqual(server['inbounds'][0]['users'][0]['uuid'], new['uuid'])
-            self.assertEqual(client['outbounds'][0]['uuid'], new['uuid'])
-            self.assertIn(new['uuid'], (output / 'clients.txt').read_text())
+            self.assertEqual(server['inbounds'][0]['users'][0]['uuid'], new['devices']['default'])
+            self.assertEqual(client['outbounds'][0]['uuid'], new['devices']['default'])
+            self.assertIn(new['devices']['default'], (output / 'clients.txt').read_text())
             self.assertNotIn(new['private_key'], (output / 'client-sing-box.json').read_text())
 
     def test_existing_credentials_are_not_regenerated(self):
@@ -119,7 +119,11 @@ ufw allow 10443/tcp comment 'warp-pipe-proxy Reality'
             migrated_credentials = json.loads((out/'credentials.json').read_text())
             self.assertNotIn('socks_port', migrated_settings)
             self.assertNotIn('socks_user', migrated_settings)
-            self.assertEqual(migrated_credentials, {k: v for k, v in self.credentials.items() if k != 'socks_password'})
+            self.assertEqual(migrated_credentials['devices'], {'default': self.credentials['uuid']})
+            self.assertNotEqual(migrated_credentials['probe_uuid'], self.credentials['uuid'])
+            self.assertNotIn('socks_password', migrated_credentials)
+            for key in ('private_key', 'public_key', 'short_id'):
+                self.assertEqual(migrated_credentials[key], self.credentials[key])
             self.assertEqual(json.loads((root/'credentials.json').read_text()), self.credentials)
             self.assertEqual((out/'clients.txt').stat().st_mode & 0o777, 0o600)
 

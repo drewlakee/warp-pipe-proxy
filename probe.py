@@ -9,20 +9,28 @@ import tempfile
 import time
 
 
+def client_outbound(settings, credentials):
+    return {
+        'type': 'vless', 'tag': 'probe', 'server': '127.0.0.1',
+        'server_port': settings['vless_port'], 'uuid': credentials['uuid'],
+        'flow': 'xtls-rprx-vision',
+        'tls': {'enabled': True, 'server_name': settings['reality_host'],
+                'utls': {'enabled': True, 'fingerprint': 'chrome'},
+                'reality': {'enabled': True, 'public_key': credentials['public_key'],
+                            'short_id': credentials['short_id']}}
+    }
+
+
 def client_config(settings, credentials, port):
+    return request_config(client_outbound(settings, credentials), port)
+
+
+def request_config(outbound, port):
     return {
         'log': {'level': 'error'},
         'inbounds': [{'type': 'mixed', 'listen': '127.0.0.1', 'listen_port': port}],
-        'outbounds': [{
-            'type': 'vless', 'tag': 'probe', 'server': '127.0.0.1',
-            'server_port': settings['vless_port'], 'uuid': credentials['uuid'],
-            'flow': 'xtls-rprx-vision',
-            'tls': {'enabled': True, 'server_name': settings['reality_host'],
-                    'utls': {'enabled': True, 'fingerprint': 'chrome'},
-                    'reality': {'enabled': True, 'public_key': credentials['public_key'],
-                                'short_id': credentials['short_id']}}
-        }],
-        'route': {'final': 'probe'}
+        'outbounds': [outbound],
+        'route': {'final': outbound['tag']}
     }
 
 
@@ -42,12 +50,18 @@ def owns_port(port):
 def probe(root, url='https://example.com', diagnostic=False):
     settings = json.loads((root / 'settings.json').read_text())
     credentials = json.loads((root / 'credentials.json').read_text())
+    if 'probe_uuid' in credentials:
+        credentials['uuid'] = credentials['probe_uuid']
+    request(client_outbound(settings, credentials), url, diagnostic)
+
+
+def request(outbound, url, diagnostic=False):
     with tempfile.TemporaryDirectory(prefix='vps-reality-probe-') as directory:
         path = Path(directory) / 'client.json'
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
-        path.write_text(json.dumps(client_config(settings, credentials, port)))
+        path.write_text(json.dumps(request_config(outbound, port)))
         path.chmod(0o600)
         subprocess.run(['sing-box', 'check', '-c', str(path)], check=True, timeout=15)
         with open(Path(directory) / 'client.log', 'w+') as output:

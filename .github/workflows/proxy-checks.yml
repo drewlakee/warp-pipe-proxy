@@ -1,0 +1,25 @@
+name: Proxy checks
+on: [pull_request, workflow_dispatch]
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -B -m unittest discover
+      - run: for script in *.sh tests/*.sh; do bash -n "$script" || exit; done
+
+  ubuntu-vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare LXD on the disposable runner
+        run: |
+          if ! snap list lxd >/dev/null 2>&1; then sudo snap install lxd; fi
+          sudo lxd waitready
+          if ! sudo lxc profile show default | grep -q 'type: disk'; then sudo lxd init --auto; fi
+      - name: Exercise the installer and proxy from outside the VM
+        run: sudo env PATH="$PATH" bash tests/ubuntu-vm.sh

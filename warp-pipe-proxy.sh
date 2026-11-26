@@ -12,18 +12,20 @@ MODE_SELECTED=0
 # Сервисные команды не запускают установку и не создают журналы с секретами профиля.
 CLI_ARGS=("$@")
 CHECK_URL=''
+DEVICE=''
 while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
-        install|check|status|doctor|logs|client-config|client-profile|client-qr|rotate-keys)
+        install|check|status|doctor|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
             MODE_SELECTED=1
             ;;
-        --url|--endpoint|--port|--since|--filter)
+        --url|--endpoint|--port|--since|--filter|--device)
             [[ $# -ge 2 ]] || { echo "Missing value for $1"; exit 2; }
             if [[ $1 == --url ]]; then CHECK_URL=$2; fi
+            if [[ $1 == --device ]]; then DEVICE=$2; fi
             shift
             ;;
         --follow) ;;
@@ -41,7 +43,7 @@ else
     python3 "$BASE/admin.py" "${CLI_ARGS[@]}" --validate-only
 fi
 case "$MODE" in
-    status|doctor|logs|client-profile|client-qr) exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}" ;;
+    status|doctor|logs) exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}" ;;
 esac
 # Проверяем базовое окружение до создания файлов и запуска служб.
 [[ $EUID == 0 ]] || { echo 'Run with sudo/root'; exit 1; }
@@ -56,14 +58,15 @@ if [[ -e /etc/vps-proxy || -e /etc/systemd/system/vps-proxy.service ]]; then
     exit 1
 fi
 ROOT=/etc/warp-pipe-proxy
-# Секретные ссылки выводим отдельно, до подключения общего журнала.
-if [[ $MODE == client-config ]]; then
-    cat "$ROOT/clients.txt"
-    exit
-fi
 command -v flock >/dev/null || { echo 'flock is required'; exit 1; }
-# Дескриптор остаётся открытым до выхода, удерживая блокировку от второго установщика.
+# Export only committed credentials; the installer and device changes hold an exclusive lock.
 exec 9>/run/lock/warp-pipe-proxy.lock
+case "$MODE" in
+    client-config|client-profile|client-qr|device-list)
+        flock -s 9
+        exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}"
+        ;;
+esac
 flock -n 9 || { echo 'Another installer is running'; exit 1; }
 install -d -m 700 /var/log/warp-pipe-proxy-installer
 RUN=$(date -u +%Y%m%dT%H%M%SZ)-$$
@@ -280,7 +283,7 @@ prepare_proxy_configuration() {
     STAGE=$(mktemp -d /var/lib/warp-pipe-proxy-installer/stage.XXXXXX)
     python3 "$BASE/configure.py" render --out "$STAGE"
     sing-box check -c "$STAGE/config.json"
-    sing-box check -c "$STAGE/client-sing-box.json"
+    if [[ -f $STAGE/client-sing-box.json ]]; then sing-box check -c "$STAGE/client-sing-box.json"; fi
     id warp-pipe-proxy >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/warp-pipe-proxy --create-home --shell /usr/sbin/nologin warp-pipe-proxy
     install -d -m 750 -o root -g warp-pipe-proxy /etc/sing-box
 }
@@ -361,6 +364,7 @@ EOF
 apply_validated_configuration() {
     firewall_backend_check
     protect_listeners
+    prepare_ssh_firewall
     begin_transaction
     stage 'Applying validated configurations'
     install -m 600 "$STAGE/settings.json" "$ROOT/settings.json"
@@ -395,9 +399,11 @@ configure_firewall() {
     log 'Applying UFW rules without resetting existing rules'
     # Флаг устанавливаем до первой команды UFW, чтобы откат обработал и частичное применение.
     FIREWALL_CHANGED=1
-    for port in $SSH_PORTS; do
-        ufw allow "$port/tcp" comment 'warp-pipe-proxy SSH preservation'
-    done
+    if [[ $UFW_ACTIVE == no ]]; then
+        for port in $SSH_PORTS; do
+            ufw allow proto tcp from "$SSH_SOURCE" to any port "$port" comment 'warp-pipe-proxy SSH source'
+        done
+    fi
     log 'Removing legacy installer-managed SOCKS firewall rules'
     python3 "$BASE/configure.py" remove-legacy-socks-rules
     ufw allow "$(read_setting vless_port)/tcp" comment 'warp-pipe-proxy Reality'
@@ -411,8 +417,7 @@ configure_firewall() {
 # Сохраняем результаты только после проверок; затем отключаем откат конфигураций.
 save_installation_results() {
     stage 'Saving client links and final settings'
-    install -m 600 "$STAGE/clients.txt" "$ROOT/clients.txt"
-    install -m 600 "$STAGE/client-sing-box.json" "$ROOT/client-sing-box.json"
+    save_default_exports
     touch "$ROOT/installed"
     python3 "$BASE/configure.py" summary > "$ROOT/summary.json"
     install_cli_command
@@ -427,8 +432,11 @@ finish_installation() {
     rm -rf -- "$STAGE"
     banner 'DONE | Installation and local checks completed'
     log SUCCESS 'SUCCESS: VLESS Reality configured'
-    log "Client links (secrets): $ROOT/clients.txt; settings: $ROOT/settings.json; credentials: $ROOT/credentials.json"
-    log "sing-box client profile: $ROOT/client-sing-box.json; import it on the client"
+    if [[ -f $ROOT/client-sing-box.json ]]; then
+        log "Default client exports: $ROOT/clients.txt and $ROOT/client-sing-box.json"
+    else
+        log 'Default device is revoked; select an active device with --device'
+    fi
     log WARN 'For LAN access, change the client profile server address to the laptop IP and published port'
     log 'Next: export a profile with client-profile, import it into sing-box and enable VPN/TUN'
     log 'Use --endpoint LAPTOP_LAN_IP --port PUBLISHED_PORT when exporting for Podman'
@@ -469,5 +477,5 @@ case "$MODE" in
         fi
         ;;
     install) run_installation ;;
-    rotate-keys) rotate_keys ;;
+    rotate-keys|device-add|device-revoke) update_credentials ;;
 esac
