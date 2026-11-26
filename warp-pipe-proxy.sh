@@ -14,21 +14,20 @@ MODE_SELECTED=0
 CLI_ARGS=("$@")
 CHECK_URL=''
 DEVICE=''
-BACKUP_RUN=''
+APT_SOURCE_CREATED=0
 while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
-        install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke|uninstall|restore)
+        install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke|uninstall)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
             MODE_SELECTED=1
             ;;
-        --url|--endpoint|--port|--since|--filter|--device|--backup)
+        --url|--endpoint|--port|--since|--filter|--device)
             [[ $# -ge 2 ]] || { echo "Missing value for $1"; exit 2; }
             if [[ $1 == --url ]]; then CHECK_URL=$2; fi
             if [[ $1 == --device ]]; then DEVICE=$2; fi
-            if [[ $1 == --backup ]]; then BACKUP_RUN=$2; fi
             shift
             ;;
         --follow) ;;
@@ -71,6 +70,11 @@ case "$MODE" in
         ;;
 esac
 flock -n 9 || { echo 'Another installer is running'; exit 1; }
+# Удаление не создаёт новый журнал или резервную копию и не запускает откат.
+# Python загружает нужные модули до удаления установленной команды и её файлов.
+if [[ $MODE == uninstall ]]; then
+    exec python3 "$BASE/lifecycle.py" uninstall
+fi
 install -d -m 700 /var/log/warp-pipe-proxy-installer
 RUN=$(date -u +%Y%m%dT%H%M%SZ)-$$
 LOG=/var/log/warp-pipe-proxy-installer/$RUN.log
@@ -116,8 +120,6 @@ on_error() {
     log ERROR "FAILED line=$line exit=$status. See $LOG." >&2
     if [[ $MODE == device-revoke ]]; then
         log ERROR 'An incomplete applied revocation leaves the proxy stopped; revoked access is not rolled back. Inspect the recovery instructions below.' >&2
-    elif [[ $MODE == uninstall ]]; then
-        log ERROR 'Uninstall preserves recovery state; rerun uninstall from the project checkout to finish an interrupted removal.' >&2
     else
         log ERROR 'Managed configuration will be rolled back if application has started; packages and generated credentials are retained.' >&2
     fi
@@ -163,10 +165,13 @@ check_installation_prerequisites() {
         [[ -f $BASE/$helper ]] || { log ERROR "$helper must be next to warp-pipe-proxy.sh"; exit 1; }
     done
     if [[ ! -e $ROOT/managed ]]; then
-        local unmanaged_paths=(/etc/sing-box /etc/unbound)
-        if (( ! CONTAINER_MODE )); then unmanaged_paths+=(/etc/fail2ban); fi
-        for item in "${unmanaged_paths[@]}"; do
-            [[ ! -e $item ]] || { log ERROR "Existing $item found: refusing to overwrite an unmanaged installation"; exit 1; }
+        [[ ! -e /etc/sing-box && ! -L /etc/sing-box ]] || { log ERROR 'Existing /etc/sing-box found: refusing to overwrite an unmanaged installation'; exit 1; }
+        local dependencies=(unbound)
+        if (( ! CONTAINER_MODE )); then dependencies+=(fail2ban); fi
+        for item in "${dependencies[@]}"; do
+            if [[ -e /etc/$item || -L /etc/$item ]]; then
+                check_pristine_package_tree "/etc/$item" "$item"
+            fi
         done
     fi
     export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
@@ -246,6 +251,7 @@ Enabled: yes
 Signed-By: /etc/apt/keyrings/sagernet.asc
 EOF
         chmod 644 /etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources
+        APT_SOURCE_CREATED=1
         apt-get update
         apt-get install -y sing-box
     fi
@@ -437,6 +443,7 @@ save_installation_results() {
     install_cli_command
     local lifecycle_args=(record)
     if (( CONTAINER_MODE )); then lifecycle_args+=(--container); fi
+    if (( APT_SOURCE_CREATED )); then lifecycle_args+=(--apt-source-created); fi
     python3 "$BASE/lifecycle.py" "${lifecycle_args[@]}"
     # Все обязательные проверки завершены, последующие ошибки не откатывают рабочую установку.
     TRANSACTION=0
@@ -446,6 +453,9 @@ save_installation_results() {
 finish_installation() {
     stage 'Configuring TCP BBR (optional)'
     configure_bbr || log WARN 'BBR skipped after an optional optimization error'
+    if [[ -f $STAGE/bbr-applied ]]; then
+        python3 "$BASE/lifecycle.py" record-host-files --applied
+    fi
     rm -rf -- "$STAGE"
     banner 'DONE | Installation and local checks completed'
     log SUCCESS 'SUCCESS: VLESS Reality configured'
@@ -492,22 +502,4 @@ case "$MODE" in
         ;;
     install) run_installation ;;
     rotate-keys|device-add|device-revoke) update_credentials ;;
-    uninstall)
-        stage 'Removing owned proxy components and preserving recovery state'
-        python3 "$BASE/lifecycle.py" uninstall --run "$RUN"
-        ;;
-    restore)
-        stage 'Validating the latest completed uninstall snapshot'
-        install -d -m 700 /var/lib/warp-pipe-proxy-installer
-        STAGE=$(mktemp -d /var/lib/warp-pipe-proxy-installer/restore.XXXXXX)
-        CONTAINER_MODE=$(python3 "$BASE/lifecycle.py" prepare-restore --backup "$BACKUP_RUN" --out "$STAGE")
-        [[ $CONTAINER_MODE == 0 || $CONTAINER_MODE == 1 ]] || { log ERROR 'Invalid container mode in recovery snapshot'; exit 1; }
-        # prepare-restore подтверждает совпадение сохранённых settings/credentials
-        # с последним снимком. Установка повторно использует эти же ключи;
-        # старые unit-файлы, скрипты и firewall из копий не исполняются.
-        rm -rf -- "$STAGE"
-        STAGE=''
-        MODE=install
-        run_installation
-        ;;
 esac

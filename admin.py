@@ -2,7 +2,6 @@ import argparse
 import ipaddress
 import json
 import os
-import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -19,7 +18,7 @@ ROOT = Path('/etc/warp-pipe-proxy')
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog='warp-pipe-proxy.sh', description='Warp Pipe Proxy: install, inspect and troubleshoot VLESS Reality')
     parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'activity', 'client-config', 'client-profile', 'client-qr', 'rotate-keys',
-                                           'device-add', 'device-revoke', 'device-list', 'uninstall', 'restore'])
+                                           'device-add', 'device-revoke', 'device-list', 'uninstall'])
     parser.add_argument('--container', action='store_true', help='Do not manage host firewall or fail2ban')
     parser.add_argument('--url', help='HTTP(S) site to compare directly and through VLESS; no redirects followed')
     parser.add_argument('--endpoint', help='Override client server IP (including private LAN IP); does not change server settings')
@@ -28,20 +27,16 @@ def parse_args(argv=None):
     parser.add_argument('--follow', action='store_true', help='Follow new journal entries')
     parser.add_argument('--since', help='Journal start time, e.g. "10 minutes ago"')
     parser.add_argument('--filter', help='Literal journal substring, e.g. destination IP or connection ID')
-    parser.add_argument('--backup', metavar='RUN', help='Latest completed uninstall snapshot ID to restore')
     parser.add_argument('--validate-only', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     device_commands = ('device-add', 'device-revoke', 'client-profile', 'client-config', 'client-qr')
     for names, commands in [(('url',), ('check', 'doctor')), (('endpoint', 'port'), ('client-profile', 'client-qr')),
                             (('device',), (*device_commands, 'activity')),
-                            (('follow', 'since'), ('logs', 'activity')), (('filter',), ('logs',)),
-                            (('backup',), ('restore',))]:
+                            (('follow', 'since'), ('logs', 'activity')), (('filter',), ('logs',))]:
         if args.command not in commands and any(getattr(args, name) not in (None, False) for name in names):
             parser.error(f'{", ".join(names)} only supported for {", ".join(commands)}')
-    if args.command in ('uninstall', 'restore') and args.container:
-        parser.error('uninstall preserves host settings; restore reads container mode from its snapshot')
-    if args.command == 'restore' and (args.backup is None or not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z-[0-9]+', args.backup)):
-        parser.error('restore requires --backup RUN, e.g. 20261126T120000Z-1234 (not a path)')
+    if args.command == 'uninstall' and args.container:
+        parser.error('uninstall reads the installation mode from its ownership metadata')
     if args.device is not None and not configure.valid_device_name(args.device):
         parser.error('--device requires 1..32 lowercase letters, digits, hyphens or underscores')
     if args.command in device_commands and args.device is None:

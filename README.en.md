@@ -211,7 +211,9 @@ To remove one device, use `device-revoke`. A running service restarts and other 
 
 **Revocation commits after local configuration validation and application.** Failure of the subsequent external HTTPS request produces a warning, but the device stays revoked and the command succeeds. Device addition and key rotation still roll back when their mandatory checks fail.
 
-If writing the revoked configuration or starting the service fails, the command returns an error and leaves the proxy stopped with autostart disabled. Old access is not automatically restored. The validated state without the revoked device remains in `/var/lib/warp-pipe-proxy-installer/<RUN>/revocation/`, and `/etc/warp-pipe-proxy/revocation-pending.json` records the incomplete revocation. If `credentials.json` was already replaced, reinstalling regenerates the configuration from those current revoked credentials. If writing credentials itself failed, installation refuses to start the proxy with old keys: first restore **the validated `revocation/credentials.json` from the indicated run** with mode `0600`, then reinstall. Do not use the pre-revocation backup. Further device changes, `uninstall` and `restore` are blocked until recovery completes. Inspect the failure in the log first; do not remove the pending marker manually. The uninstall recovery command below does not accept these intermediate snapshots.
+If writing the revoked configuration or starting the service fails, the command returns an error and leaves the proxy stopped with autostart disabled. Old access is not automatically restored. The validated state without the revoked device remains in `/var/lib/warp-pipe-proxy-installer/<RUN>/revocation/`, and `/etc/warp-pipe-proxy/revocation-pending.json` records the incomplete revocation. If `credentials.json` was already replaced, reinstalling regenerates the configuration from those current revoked credentials. If writing credentials itself failed, installation refuses to start the proxy with old keys: first apply **the validated `revocation/credentials.json` from the indicated run** with mode `0600`, then reinstall. Do not use the pre-revocation backup. Further device changes are blocked until this operation completes. Inspect the failure in the log first; do not remove the pending marker manually.
+
+If you no longer need the proxy, `uninstall` is allowed even when revocation is incomplete. It permanently deletes the project data, including keys, the pending marker and every revocation copy. See [Uninstall](#uninstall) for the removal scope.
 
 ## Settings and upgrades
 
@@ -233,7 +235,7 @@ When `settings.json` is first created, you can pass `VPS_PUBLIC_IP` (your public
 sudo env VPS_REALITY_HOST=www.microsoft.com ./warp-pipe-proxy.sh install
 ```
 
-Once `settings.json` exists, these variables do not override it: make subsequent changes in that file. Manage devices with `device-add`, `device-revoke` and `rotate-keys`; do not manually edit `credentials.json`. Reinstallation preserves existing UUIDs and Reality keys without rotating them automatically. Pass `--container` on every `install` and `check`; the saved installation mode is used automatically only when restoring an uninstall snapshot with `restore`.
+Once `settings.json` exists, these variables do not override it: make subsequent changes in that file. Manage devices with `device-add`, `device-revoke` and `rotate-keys`; do not manually edit `credentials.json`. Reinstalling over an existing installation preserves UUIDs and Reality keys without rotating them automatically. A new installation after `uninstall` creates new keys. Pass `--container` on every `install` and `check`.
 
 To upgrade, run `git pull --ff-only` in the project directory, then repeat the install command for your setup. When upgrading from the older single-UUID version, existing clients retain access. Export that UUID explicitly with `--device default`. Add any required private subnets before upgrading.
 
@@ -262,14 +264,13 @@ All files in the following table are under **`/etc/warp-pipe-proxy/`**. The dire
 | --- | --- |
 | `settings.json` | Public IP, ports, Reality server and private subnet exceptions. Edit this file to change server parameters. |
 | `credentials.json` | The Reality private/public key pair, short ID, internal check UUID, and device registry with UUIDs and revocations. Managed through device commands; contains access credentials. |
-| `managed`, `installed` | Markers for a managed installation and successful completion. `uninstall` removes `installed`. |
+| `managed`, `installed` | Markers for a managed installation and successful completion. Removed with the entire directory by `uninstall`. |
 | `summary.json`, `tls-check.txt` | Settings summary from the last successful install and output from the initial Reality server check. These are diagnostic files, not configuration inputs. |
-| `ownership.json` | Hashes of owned proxy/CLI files and the container mode of the last successful installation. Used to verify safe removal. |
-| `uninstalled.json` | Removal state and a reference to its latest snapshot. Allows interrupted removal to resume and determines whether `restore` is permitted. |
-| `revocation-pending.json` | Marker for an incomplete revocation, with hashes of the validated intended credentials. Blocks operations that could restore old access. |
+| `ownership.json` | Hashes of project-owned proxy files, installed command files and additional configurations. Used to verify file ownership before removal. |
+| `revocation-pending.json` | Marker for an incomplete revocation, with hashes of the validated intended credentials. Blocks further device changes and applying old keys; complete removal remains available. |
 | `clients.txt`, `client-sing-box.json` | Compatibility exports for an older installation using the `default` profile; not automatically created for a fresh installation. Contain proxy access credentials. Export current device profiles with `--device`. |
 
-Do not edit the internal markers or hashes manually. See [Management and diagnostics](#management-and-diagnostics) and [Uninstall and restore](#uninstall-and-restore) for handling snapshots and interrupted operations.
+Do not edit the internal markers or hashes manually. See [Management and diagnostics](#management-and-diagnostics) and [Uninstall](#uninstall) for handling copies and interrupted operations. Successful `uninstall` removes the entire `/etc/warp-pipe-proxy/` directory.
 
 ### Service configurations and installed command
 
@@ -282,7 +283,8 @@ Do not edit the internal markers or hashes manually. See [Management and diagnos
 | `/usr/local/bin/warp-pipe-proxy` | Command launcher; root, mode `0755`. Uses the installed project copy, so routine management does not require the original checkout. |
 | `/usr/local/lib/warp-pipe-proxy/` | Installed shell/Python modules and the `.managed` marker; directory mode `0755`, root-owned files with mode `0644`. Updated when installing from a checkout. |
 | `/var/lib/warp-pipe-proxy/` | Working directory and home directory for the `warp-pipe-proxy` system user. Keys and settings are stored separately under `/etc/warp-pipe-proxy/`. |
-| `/etc/apt/keyrings/sagernet.asc`, `/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources` | Key and definition for the official sing-box APT repository; root, mode `0644`. Added when sing-box is not already installed. |
+| `/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources` | Definition for the official sing-box APT repository; root, mode `0644`. Added when sing-box is not already installed; the project-owned file is removed by `uninstall`. |
+| `/etc/apt/keyrings/sagernet.asc` | Shared sing-box repository key; root, mode `0644`. Other APT sources may use it, so it is retained after project removal. |
 | `/etc/sysctl.d/90-warp-pipe-proxy.conf`, `/etc/modules-load.d/warp-pipe-proxy.conf` | Persistent `fq`/BBR settings and `tcp_bbr` module loading. Created when this optional optimization is successfully enabled outside a container. |
 | `/etc/ufw/`, `/etc/default/ufw` | Shared UFW configuration. Initialized by the installer only when no existing firewall policy is present; an active firewall retains its own rules. |
 
@@ -292,27 +294,37 @@ Do not edit the internal markers or hashes manually. See [Management and diagnos
 
 | Path | Purpose |
 | --- | --- |
-| `/var/log/warp-pipe-proxy-installer/<RUN>.log` | Output from installation, checking or a state-changing operation. The proxy's own log is in the systemd journal: `sudo warp-pipe-proxy logs` or `sudo journalctl -u warp-pipe-proxy`. |
+| `/var/log/warp-pipe-proxy-installer/<RUN>.log` | Output from installation, checking or device changes. `uninstall` removes the entire directory and does not create its own log. The proxy's own log is in the shared systemd journal: `sudo warp-pipe-proxy logs` or `sudo journalctl -u warp-pipe-proxy`. |
 | `/var/lib/warp-pipe-proxy-installer/<RUN>/` | Snapshot for a particular operation. Installation backups contain original system files with their paths, such as `etc/…`. Snapshots may contain earlier private keys and UUIDs. |
-| `/var/lib/warp-pipe-proxy-installer/<RUN>/transaction/` | Files for rolling back configuration application. Sibling files `paths`, `active` and `enabled` record paths and service activity/enablement. This is not a snapshot for the `restore` command. |
+| `/var/lib/warp-pipe-proxy-installer/<RUN>/transaction/` | Files for rolling back configuration application. Sibling files `paths`, `active` and `enabled` record paths and service activity/enablement. |
 | `/var/lib/warp-pipe-proxy-installer/<RUN>/revocation/` | Validated configuration without the revoked device, retained to finish revocation after a failure. Contains the intended settings/credentials and generated files. |
-| `/var/lib/warp-pipe-proxy-installer/<RUN>/{settings.json,credentials.json,ownership.json,recovery.json}` | The separate uninstall snapshot format: current settings, credentials and verification metadata. `restore` accepts only the latest completed snapshot referenced by `uninstalled.json`. |
-| `/var/lib/warp-pipe-proxy-installer/{stage.*,rotate.*,restore.*}` | Temporary directories for configuration preparation, credential changes and recovery validation. Removed on normal operation exit, including handled failures. |
+| `/var/lib/warp-pipe-proxy-installer/{stage.*,rotate.*}` | Temporary directories for configuration preparation and credential changes. Removed on normal operation exit, including handled failures. |
+| `/var/lib/warp-pipe-proxy-uninstalling.json` | Temporary deletion marker without keys or profiles: contains hashes of project-owned files and the state of shared services. Allows interrupted cleanup to resume and is deleted on success. |
 | `/run/lock/warp-pipe-proxy.lock` | Lock preventing concurrent installation changes or exports of intermediate credential state. |
 
-When backing up, account for both parts of the state: `/etc/warp-pipe-proxy/` and the needed snapshots under `/var/lib/warp-pipe-proxy-installer/`. The section below explains which snapshots can be used and what is retained after removal.
+Copies for installation rollback and completing revocation remain while the project is installed. `uninstall` deletes the entire `/var/lib/warp-pipe-proxy-installer/` directory, including old copies, the secrets they contain and leftover temporary directories. It does not create a new copy before removal.
 
-## Uninstall and restore
+## Uninstall
 
-For an older installation, update the checkout and successfully reapply this installer version once before uninstalling. This creates `/etc/warp-pipe-proxy/ownership.json` with hashes of files owned by the project. Automated removal refuses to guess ownership without it. To stop the server immediately without upgrading, use `sudo systemctl disable --now warp-pipe-proxy`; the keys remain intact.
+For an older installation, update the checkout and successfully reapply this installer version once before uninstalling. This creates `/etc/warp-pipe-proxy/ownership.json` with hashes of project-owned files. Automated removal refuses to guess ownership without that information. Older metadata may not cover additional configuration files; those files are retained with a warning. To stop the server immediately without upgrading, use `sudo systemctl disable --now warp-pipe-proxy`; the keys remain intact.
 
 ```bash
 sudo warp-pipe-proxy uninstall
 ```
 
-The command first verifies ownership and archives current settings and credentials in a separate root-only snapshot. It then stops and disables the proxy service and removes its unit, generated `/etc/sing-box/config.json`, installed command and supporting code. A manually edited managed file aborts removal before the service is stopped: preserve your changes and review the conflict. Output includes the recovery snapshot identifier `<RUN>`.
+**The command deletes the project and its data without creating a new backup.** It verifies managed-file ownership, stops and disables the proxy service, then performs cleanup. If ownership cannot be verified or a managed file was edited manually, resolve the reported conflict first; the command does not delete unrelated configurations. An incomplete device revocation does not prevent permanent removal.
 
-**Retained:** the private `/etc/warp-pipe-proxy/` directory with keys and recovery state, logs and backups, system packages and service account, Unbound and fail2ban with their configuration, BBR, and every UFW rule, including SSH and proxy allowances. Removing the proxy does not return the whole OS to its pre-install state. A retained port allowance does not create a listening service; review shared host policy separately before cleaning it up.
+| What is removed | Contents |
+| --- | --- |
+| Settings, keys and profiles | The entire `/etc/warp-pipe-proxy/` directory, including credentials, settings, compatibility exports, hashes and the pending-revocation marker. |
+| Proxy and installed command | `/etc/sing-box/config.json`, the `warp-pipe-proxy.service` unit, `/usr/local/bin/warp-pipe-proxy`, the entire `/usr/local/lib/warp-pipe-proxy/` directory and `/var/lib/warp-pipe-proxy/`. `/etc/sing-box/` is removed if deleting the configuration leaves it empty. |
+| Old backups and installer logs | The entire `/var/lib/warp-pipe-proxy-installer/` and `/var/log/warp-pipe-proxy-installer/` directories. No new snapshot or uninstall log is created. |
+| Additional project-owned files | Its Unbound and fail2ban configuration, BBR module-loading and sysctl files, and `warp-pipe-proxy-sagernet.sources` APT source. Only files whose ownership is verified are removed. |
+| Proxy port allowances in UFW | Only rules in their original form with the exact `warp-pipe-proxy Reality` comment. Administrator rules, including rules for the same port, are preserved. Modified rules and allowances for ports now used by SSH are retained with a warning. |
+
+**Shared host components remain:** system packages and the `warp-pipe-proxy` system user, shared Unbound/fail2ban settings and data, `/etc/apt/keyrings/sagernet.asc`, current UFW policies and SSH rules. Removal does not reset or disable the firewall. Persistent BBR configuration files are deleted, but current kernel parameters remain until a reboot or an explicit administrator change; the installer does not reset them to earlier values. Proxy entries in the shared systemd journal are not individually deleted: clearing that journal would affect other services.
+
+After successful removal, the listed project directories contain no settings or keys. A new installation generates new keys and an empty device registry: add devices and issue new profiles. Previously issued QR codes, links and JSON profiles will not work. Retained changes to shared host configuration may need review before a new installation. An active UFW remains active and the installer preserves its existing policy: if the proxy port allowance was deleted, add the required allowance yourself. Your source checkout and files that you exported or copied outside the listed directories remain yours to manage.
 
 If removal is interrupted, resume it from the saved checkout:
 
@@ -320,14 +332,4 @@ If removal is interrupted, resume it from the saved checkout:
 sudo ./warp-pipe-proxy.sh uninstall
 ```
 
-Removal resumes from its saved state. Installation and restore refuse to proceed until removal finishes. Repeating an already completed uninstall is safe and reports the same snapshot.
-
-To restore, use a trusted checkout of the same or a compatible newer version and the exact identifier printed by uninstall, for example:
-
-```bash
-sudo ./warp-pipe-proxy.sh restore --backup 20261126T120000Z-1234
-```
-
-Only **the latest completed uninstall snapshot on this server** is accepted. The command checks hashes, file permissions, absence of a new installation, and that retained settings/credentials still match the snapshot. Older transaction backups, interrupted removal and credentials changed after uninstall are rejected. This prevents accidental revival of previously revoked devices. This snapshot supports recovery from removal on the same server; recovery after complete disk loss needs a separate backup of the server state.
-
-Restore regenerates configuration with current code, runs normal installation checks and reuses retained keys. It does not replay archived scripts, units or firewall state. Container mode is read from the snapshot, so `restore` does not take `--container`. After success, previously active profiles work again, revoked devices remain revoked, and the consumed uninstall snapshot is no longer eligible for automatic restore. Check external reachability from a client device.
+Resuming uses only the temporary `/var/lib/warp-pipe-proxy-uninstalling.json` deletion-progress marker, without keys or profiles. Installation is blocked until cleanup finishes. The marker is deleted on success; repeating the command from a checkout makes no changes if the project is already removed. `uninstall` is also available during an incomplete device revocation and permanently deletes all related data.

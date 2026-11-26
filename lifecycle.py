@@ -1,10 +1,11 @@
-"""Conservative proxy removal and recovery; host-wide configuration is retained."""
+"""Track owned files, preserve revocation intent, and completely remove the proxy."""
 
 import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import stat
@@ -19,10 +20,20 @@ UNIT = '/etc/systemd/system/warp-pipe-proxy.service'
 LAUNCHER = '/usr/local/bin/warp-pipe-proxy'
 BUNDLE = '/usr/local/lib/warp-pipe-proxy'
 BUNDLE_FILES = ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py',
-                'probe.py', 'admin.py', 'activity.py', 'lifecycle.py', '.managed')
+                'probe.py', 'admin.py', 'activity.py', 'lifecycle.py', 'uninstall_firewall.py', '.managed')
 OWNED_FILES = (CONFIG, UNIT, LAUNCHER, *(BUNDLE + '/' + name for name in BUNDLE_FILES))
+LEGACY_FILES = tuple(name for name in OWNED_FILES if not name.endswith('/uninstall_firewall.py'))
+UNBOUND = '/etc/unbound/unbound.conf.d/warp-pipe-proxy.conf'
+FAIL2BAN = '/etc/fail2ban/jail.d/warp-pipe-proxy.local'
+BBR_FILES = ('/etc/sysctl.d/90-warp-pipe-proxy.conf', '/etc/modules-load.d/warp-pipe-proxy.conf')
+APT_SOURCE = '/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources'
+HOST_FILES = (UNBOUND, FAIL2BAN, *BBR_FILES, APT_SOURCE)
+ALL_FILES = (*OWNED_FILES, *HOST_FILES)
+PURGE_MARKER = '/var/lib/warp-pipe-proxy-uninstalling.json'
+LOG_DIRECTORY = '/var/log/warp-pipe-proxy-installer'
+STATE_DIRECTORY = '/var/lib/warp-pipe-proxy'
 STATE_FILES = ('settings.json', 'credentials.json')
-FORMAT = 'warp-pipe-proxy-recovery-v1'
+PURGE_FORMAT = 'warp-pipe-proxy-uninstall-v1'
 REVOCATION_FORMAT = 'warp-pipe-proxy-revocation-v1'
 
 
@@ -39,7 +50,7 @@ def sync_directory(path):
 
 
 def write_private(path, data):
-    """Publish a complete root-only file before a recovery marker can reference it."""
+    """Publish complete root-only metadata and persist the rename."""
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(prefix='.' + path.name + '.', dir=path.parent, delete=False) as output:
@@ -62,12 +73,36 @@ def write_json(path, data):
 class Lifecycle:
     def __init__(self, root=Path('/etc/warp-pipe-proxy'),
                  backup_root=Path('/var/lib/warp-pipe-proxy-installer'),
-                 system_root=Path('/'), run=subprocess.run, owner_uid=None):
+                 system_root=Path('/'), run=subprocess.run, owner_uid=None,
+                 firewall_cleanup=None, service_uid=None):
         self.root = Path(root)
         self.backup_root = Path(backup_root)
         self.system_root = Path(system_root)
         self.run = run
         self.owner_uid = os.geteuid() if owner_uid is None else owner_uid
+        self.firewall_cleanup = firewall_cleanup
+        if service_uid is None:
+            try:
+                service_uid = pwd.getpwnam('warp-pipe-proxy').pw_uid
+            except KeyError:
+                pass
+        self.service_uid = service_uid
+
+    @staticmethod
+    def present(path):
+        return path.exists() or path.is_symlink()
+
+    def check_parents(self, path):
+        for parent in path.parents:
+            if parent.is_symlink():
+                raise ValueError(f'Refusing a symlink in managed path: {parent}')
+            if parent == self.system_root:
+                break
+
+    def path(self, name):
+        path = self.system_root / name.lstrip('/')
+        self.check_parents(path)
+        return path
 
     def private_directory(self, path, create=False):
         if create:
@@ -84,17 +119,9 @@ class Lifecycle:
         return path.read_bytes()
 
     def target(self, name):
-        if name not in OWNED_FILES:
+        if name not in ALL_FILES:
             raise ValueError(f'Not an installer-owned path: {name}')
-        path = self.system_root / name.lstrip('/')
-        for parent in path.parents:
-            if parent == self.system_root.parent:
-                break
-            if parent.is_symlink():
-                raise ValueError(f'Refusing a symlink in managed path: {parent}')
-            if parent == self.system_root:
-                break
-        return path
+        return self.path(name)
 
     def bundle_cache(self):
         """Only interpreter-generated caches of our own modules may accompany the bundle."""
@@ -124,40 +151,69 @@ class Lifecycle:
             paths.append(path)
         return paths
 
-    def read_manifest(self, path=None):
-        value = json.loads(self.read_file(path or self.root / 'ownership.json', private=True))
+    def validate_manifest(self, value, require_core=True):
         files = value.get('files') if isinstance(value, dict) else None
-        if (not isinstance(value, dict) or value.get('version') != 1 or type(value.get('container')) is not bool
-                or not isinstance(files, dict) or set(files) != set(OWNED_FILES)
+        required = OWNED_FILES if isinstance(value, dict) and value.get('version') == 2 else LEGACY_FILES
+        if (not isinstance(value, dict) or value.get('version') not in (1, 2) or type(value.get('container')) is not bool
+                or not isinstance(files, dict) or not set(files).issubset(ALL_FILES)
+                or (require_core and not set(required).issubset(files))
                 or not all(isinstance(h, str) and re.fullmatch(r'[0-9a-f]{64}', h) for h in files.values())):
             raise ValueError('Invalid ownership manifest; reapply the current installer first')
         return value
+
+    def read_manifest(self):
+        return self.validate_manifest(json.loads(self.read_file(self.root / 'ownership.json', private=True)))
 
     def state(self):
         values = {name: self.read_file(self.root / name, private=True) for name in STATE_FILES}
         configure.validate(json.loads(values['settings.json']), json.loads(values['credentials.json']))
         return values
 
-    def verify_owned(self, manifest, allow_missing=False):
+    def verify_owned(self, manifest, revoked_config=False):
         for name, expected in manifest['files'].items():
             path = self.target(name)
-            if not path.exists() and not path.is_symlink() and allow_missing:
+            if not self.present(path):
                 continue
-            if digest(self.read_file(path)) != expected:
+            contents = self.read_file(path)
+            if digest(contents) != expected and not (name == CONFIG and revoked_config):
                 raise ValueError(f'Managed file was changed; preserve it and review manually before uninstall: {path}')
 
-    def record(self, container=False):
+    def record(self, container=False, apt_source_created=False):
         self.private_directory(self.root)
-        self.check_revocation_committed()
+        self.check_install()
         self.state()
         self.read_file(self.root / 'installed', private=True)
         self.bundle_cache()
-        manifest = {'version': 1, 'container': bool(container), 'files': {
+        previous = self.read_manifest()['files'] if self.present(self.root / 'ownership.json') else {}
+        manifest = {'version': 2, 'container': bool(container), 'files': {
             name: digest(self.read_file(self.target(name))) for name in OWNED_FILES}}
+        # Shared package files are never recorded; these paths are specific to this project.
+        for name in HOST_FILES:
+            if name in previous:
+                manifest['files'][name] = previous[name]
+        generated = (UNBOUND, *((FAIL2BAN,) if not container else ()))
+        for name in generated:
+            if self.present(self.target(name)):
+                manifest['files'][name] = digest(self.read_file(self.target(name)))
+        if apt_source_created:
+            manifest['files'][APT_SOURCE] = digest(self.read_file(self.target(APT_SOURCE)))
         write_json(self.root / 'ownership.json', manifest)
-        (self.root / 'uninstalled.json').unlink(missing_ok=True)
         self.clear_revocation()
         sync_directory(self.root)
+
+    def record_host_files(self, applied=False):
+        """Record BBR files only after this run successfully wrote both of them."""
+        if not applied:
+            return
+        self.private_directory(self.root)
+        manifest = self.read_manifest()
+        if manifest['container']:
+            return
+        manifest['version'] = 2
+        for name in BBR_FILES:
+            path = self.target(name)
+            manifest['files'][name] = digest(self.read_file(path))
+        write_json(self.root / 'ownership.json', manifest)
 
     def record_config(self):
         """Older installations may revoke access before adopting lifecycle metadata."""
@@ -214,7 +270,7 @@ class Lifecycle:
     def refuse_pending_revocation(self):
         path = self.root / 'revocation-pending.json'
         if path.exists() or path.is_symlink():
-            raise ValueError('A revocation is unfinished; recover it before uninstall, restore or another credential change')
+            raise ValueError('A revocation is unfinished; recover it before another credential change')
 
     def check_revocation_committed(self):
         path = self.root / 'revocation-pending.json'
@@ -239,192 +295,179 @@ class Lifecycle:
                              f'{directory / "credentials.json"} to {self.root / "credentials.json"}, then rerun install. '
                              'Do not restore pre-revocation credentials')
 
-    def marker(self):
-        value = json.loads(self.read_file(self.root / 'uninstalled.json', private=True))
-        if (not isinstance(value, dict) or value.get('format') != FORMAT or value.get('phase') not in ('pending', 'complete')
-                or not self.valid_run(value.get('run'))
-                or not re.fullmatch(r'[0-9a-f]{64}', str(value.get('metadata_sha256', '')))):
-            raise ValueError('Invalid uninstall recovery marker')
-        return value
-
     def check_install(self):
-        """A new installation may not conceal interrupted removal of the old one."""
-        self.check_revocation_committed()
-        path = self.root / 'uninstalled.json'
-        if not path.exists() and not path.is_symlink():
-            return
-        self.private_directory(self.root)
-        if self.marker()['phase'] == 'pending':
+        """A new install cannot race or conceal an interrupted destructive uninstall."""
+        if self.present(self.path(PURGE_MARKER)):
             raise ValueError('Uninstall was interrupted; rerun uninstall from a trusted checkout before installing')
+        self.check_revocation_committed()
 
     @staticmethod
     def valid_run(value):
         return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,95}', value) is not None
 
-    def snapshot(self, run_id, manifest):
-        if not self.valid_run(run_id):
-            raise ValueError('Invalid recovery identifier')
-        self.private_directory(self.backup_root, create=True)
-        destination = self.backup_root / run_id
-        if destination.exists() or destination.is_symlink():
-            raise ValueError(f'Recovery path already exists: {destination}')
-        values = self.state()
-        metadata = {'format': FORMAT, 'run': run_id, 'container': manifest['container'],
-                    'state_sha256': {name: digest(data) for name, data in values.items()}}
-        ownership = (json.dumps(manifest, indent=2) + '\n').encode()
-        metadata['ownership_sha256'] = digest(ownership)
-        temporary = Path(tempfile.mkdtemp(prefix='.uninstall-', dir=self.backup_root))
-        try:
-            for name, data in values.items():
-                write_private(temporary / name, data)
-            write_private(temporary / 'ownership.json', ownership)
-            write_json(temporary / 'recovery.json', metadata)
-            metadata_hash = digest((temporary / 'recovery.json').read_bytes())
-            temporary.rename(destination)
-            sync_directory(self.backup_root)
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
-        marker = {'format': FORMAT, 'run': run_id, 'phase': 'pending', 'metadata_sha256': metadata_hash}
-        write_json(self.root / 'uninstalled.json', marker)
-        return marker
-
-    def recovery(self, marker):
-        self.private_directory(self.backup_root)
-        directory = self.backup_root / marker['run']
-        self.private_directory(directory)
-        raw = self.read_file(directory / 'recovery.json', private=True)
-        if digest(raw) != marker['metadata_sha256']:
-            raise ValueError('Recovery metadata was changed or corrupted')
-        metadata = json.loads(raw)
-        if (not isinstance(metadata, dict) or metadata.get('format') != FORMAT or metadata.get('run') != marker['run']
-                or type(metadata.get('container')) is not bool
-                or not isinstance(metadata.get('state_sha256'), dict)
-                or set(metadata['state_sha256']) != set(STATE_FILES)):
-            raise ValueError('Invalid recovery metadata')
-        raw_manifest = self.read_file(directory / 'ownership.json', private=True)
-        if digest(raw_manifest) != metadata.get('ownership_sha256'):
-            raise ValueError('Recovery ownership manifest was changed or corrupted')
-        manifest = self.read_manifest(directory / 'ownership.json')
-        if manifest['container'] != metadata['container']:
-            raise ValueError('Recovery mode does not match its ownership manifest')
-        current = self.state()
-        for name in STATE_FILES:
-            archived = self.read_file(directory / name, private=True)
-            if digest(archived) != metadata['state_sha256'][name] or current[name] != archived:
-                raise ValueError(f'Retained {name} differs from the uninstall snapshot; refusing to overwrite newer state')
-        if self.read_manifest() != manifest:
-            raise ValueError('Current ownership differs from the uninstall snapshot')
-        return metadata, manifest, current
-
-    def service_state(self):
-        result = self.run(['systemctl', 'show', '-p', 'LoadState', '-p', 'ActiveState', 'warp-pipe-proxy'],
+    def service_state(self, service='warp-pipe-proxy'):
+        result = self.run(['systemctl', 'show', '-p', 'LoadState', '-p', 'ActiveState', service],
                           capture_output=True, text=True, timeout=30, check=True)
         lines = result.stdout.strip().splitlines()
         if len(lines) != 2 or any('=' not in line for line in lines):
-            raise ValueError('Cannot determine the proxy service state safely')
+            raise ValueError(f'Cannot determine the {service} service state safely')
         values = dict(line.split('=', 1) for line in lines)
         if (set(values) != {'LoadState', 'ActiveState'}
-                or values['LoadState'] not in ('loaded', 'not-found')
+                or values['LoadState'] not in ('loaded', 'not-found', 'masked')
                 or values['ActiveState'] not in ('active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading')):
-            raise ValueError('Cannot determine the proxy service state safely')
+            raise ValueError(f'Cannot determine the {service} service state safely')
         return values
 
-    def uninstall(self, run_id):
-        self.refuse_pending_revocation()
-        self.private_directory(self.root)
-        installed = self.root / 'installed'
-        if installed.exists() or installed.is_symlink():
-            self.read_file(installed, private=True)
-        marker_path = self.root / 'uninstalled.json'
-        if marker_path.exists() or marker_path.is_symlink():
-            marker = self.marker()
-            _, manifest, _ = self.recovery(marker)
-            self.verify_owned(manifest, allow_missing=True)
-            self.bundle_cache()
-            if marker['phase'] == 'complete':
-                if (self.root / 'installed').exists() or any(self.target(name).exists() for name in OWNED_FILES):
-                    raise ValueError('Files appeared after uninstall; refusing to remove a newer installation')
-                self.require_stopped(require_missing=True)
-                return marker['run']
-        else:
-            self.read_file(self.root / 'managed', private=True)
-            self.read_file(self.root / 'installed', private=True)
-            try:
-                manifest = self.read_manifest()
-            except FileNotFoundError:
-                raise ValueError('No ownership manifest; reapply this installer version before uninstall') from None
-            self.verify_owned(manifest)
-            self.bundle_cache()
-            marker = self.snapshot(run_id, manifest)
+    def project_directories(self):
+        return (self.root, self.backup_root, self.path(LOG_DIRECTORY), self.path(STATE_DIRECTORY))
 
-        # The durable pending marker permits a later invocation to resume after interruption.
-        if self.target(UNIT).exists():
-            self.run(['systemctl', 'disable', '--now', 'warp-pipe-proxy'], check=True, timeout=30)
-        elif self.service_state()['ActiveState'] != 'inactive':
-            self.run(['systemctl', 'stop', 'warp-pipe-proxy'], check=True, timeout=30)
-        self.require_stopped()
+    def mountpoints(self):
+        # mountinfo includes bind mounts on the same filesystem, which ismount()
+        # cannot reliably distinguish from ordinary subdirectories.
+        result = []
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            fields = line.split()
+            if len(fields) < 6 or ' - ' not in line or not fields[4].startswith('/'):
+                raise ValueError('Cannot inspect mount points safely before uninstall')
+            name = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
+            result.append(Path(name))
+        if not result:
+            raise ValueError('No mount information is available for safe uninstall')
+        return result
+
+    def verify_project_directories(self):
+        # Only these fixed project directories are recursively deleted. Nested links
+        # are unlinked by fd-based rmtree, never followed outside the directory.
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise ValueError('Safe directory removal is unavailable on this platform')
+        mounts = self.mountpoints()
+        for directory in self.project_directories():
+            self.check_parents(directory)
+            if not self.present(directory):
+                continue
+            info = directory.lstat()
+            owners = {self.owner_uid}
+            if directory == self.path(STATE_DIRECTORY) and self.service_uid is not None:
+                owners.add(self.service_uid)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in owners:
+                raise ValueError(f'Refusing an unowned or symlinked project directory: {directory}')
+            if any(directory == mount or directory in mount.parents for mount in mounts):
+                raise ValueError(f'Unmount project data and nested bind mounts before uninstall: {directory}')
+            for current, names, _ in os.walk(directory, followlinks=False):
+                if os.path.ismount(current):
+                    raise ValueError(f'Unmount the project data directory before uninstall: {current}')
+                names[:] = [name for name in names if not (Path(current) / name).is_symlink()]
+
+    def read_purge_marker(self):
+        value = json.loads(self.read_file(self.path(PURGE_MARKER), private=True))
+        if (not isinstance(value, dict) or value.get('format') != PURGE_FORMAT
+                or type(value.get('revoked_config')) is not bool
+                or not isinstance(value.get('reload'), list)
+                or any(service not in ('unbound', 'fail2ban') for service in value['reload'])):
+            raise ValueError('Invalid unfinished-uninstall marker; inspect it before continuing')
+        self.validate_manifest(value.get('ownership'), require_core=False)
+        return value
+
+    def cleanup_firewall(self):
+        if self.firewall_cleanup is not None:
+            return self.firewall_cleanup(run=self.run)
+        import uninstall_firewall
+        return uninstall_firewall.remove_proxy_rules(run=self.run)
+
+    def uninstall(self):
+        """Delete owned components and all project data without making any backup."""
+        marker_path = self.path(PURGE_MARKER)
+        self.verify_project_directories()
+        if self.present(marker_path):
+            marker = self.read_purge_marker()
+            manifest = marker['ownership']
+        else:
+            manifest_path = self.root / 'ownership.json'
+            if self.present(manifest_path):
+                self.private_directory(self.root)
+                manifest = self.read_manifest()
+            else:
+                # No ownership means no permission to remove shared-location files.
+                for name in OWNED_FILES:
+                    if self.present(self.target(name)):
+                        raise ValueError(f'No ownership manifest for {name}; review the file before uninstall')
+                if not any(self.present(directory) for directory in self.project_directories()):
+                    return False
+                manifest = {'version': 2, 'container': False, 'files': {}}
+            pending = self.root / 'revocation-pending.json'
+            revoked_config = self.present(pending)
+            if revoked_config:
+                # Purge must work even when intended credentials or JSON are corrupt.
+                # Presence of the private root-owned intent permits deleting a
+                # server config committed before ownership recording could finish.
+                self.read_file(pending, private=True)
+            marker = {'format': PURGE_FORMAT, 'ownership': manifest,
+                      'revoked_config': revoked_config, 'reload': []}
+
+        self.verify_owned(manifest, revoked_config=marker['revoked_config'])
+        self.bundle_cache()
         for name in OWNED_FILES:
+            if name not in manifest['files'] and self.present(self.target(name)):
+                raise ValueError(f'File is not recorded as owned; review it before uninstall: {name}')
+        for name in HOST_FILES:
+            if name not in manifest['files'] and self.present(self.target(name)):
+                print(f'WARN: retaining an unrecorded host file: {name}')
+        if not self.present(marker_path):
+            for name, service in ((UNBOUND, 'unbound'), (FAIL2BAN, 'fail2ban')):
+                if name in manifest['files'] and self.service_state(service)['ActiveState'] == 'active':
+                    marker['reload'].append(service)
+            # Contains only hashes, paths and service names, never copied user data.
+            write_json(marker_path, marker)
+
+        unit = self.target(UNIT)
+        if self.present(unit):
+            self.run(['systemctl', 'disable', '--now', 'warp-pipe-proxy'], check=True, timeout=30)
+        else:
+            self.run(['systemctl', 'daemon-reload'], check=True, timeout=30)
+        state = self.service_state()
+        if state['ActiveState'] != 'inactive':
+            raise ValueError('Proxy is not stopped; refusing to delete its files or data')
+        if not self.present(unit) and state['LoadState'] != 'not-found':
+            raise ValueError('Unexpected replacement proxy unit; review it before continuing uninstall')
+        if not manifest['container'] and any(name in manifest['files'] for name in LEGACY_FILES):
+            self.cleanup_firewall()
+        for name in manifest['files']:
             self.target(name).unlink(missing_ok=True)
         for path in self.bundle_cache():
             path.unlink()
-        bundle = self.system_root / BUNDLE.lstrip('/')
+        bundle = self.path(BUNDLE)
         cache = bundle / '__pycache__'
         if cache.exists():
             cache.rmdir()
-        # Make all removals durable before publishing a completed recovery marker.
-        for parent in {self.target(name).parent for name in OWNED_FILES}:
+        for directory in (bundle, self.target(CONFIG).parent):
+            if directory.exists() and not any(directory.iterdir()):
+                directory.rmdir()
+                sync_directory(directory.parent)
+        for parent in {self.target(name).parent for name in manifest['files']}:
             if parent.exists():
                 sync_directory(parent)
-        if bundle.exists() and not any(bundle.iterdir()):
-            bundle.rmdir()
-            sync_directory(bundle.parent)
-        (self.root / 'installed').unlink(missing_ok=True)
-        sync_directory(self.root)
+        # Remove all retained keys, old snapshots, pending intents, logs and state.
+        # This also happens before any final service reload that might fail.
+        for directory in self.project_directories():
+            if directory.exists():
+                shutil.rmtree(directory)
+                sync_directory(directory.parent)
         self.run(['systemctl', 'daemon-reload'], check=True, timeout=30)
-        marker['phase'] = 'complete'
-        write_json(marker_path, marker)
-        return marker['run']
-
-    def require_stopped(self, require_missing=False):
-        state = self.service_state()
-        if state['ActiveState'] != 'inactive':
-            raise ValueError('Proxy service is not stopped; recovery/removal cannot continue')
-        if require_missing and state['LoadState'] != 'not-found':
-            raise ValueError('Another proxy unit is loaded after uninstall; review it before restoring')
-
-    def prepare_restore(self, run_id, out):
-        self.refuse_pending_revocation()
-        self.private_directory(self.root)
-        if (self.root / 'installed').exists() or (self.root / 'installed').is_symlink():
-            raise ValueError('An installation already exists; historical credentials will not replace it')
-        marker = self.marker()
-        if marker['phase'] != 'complete':
-            raise ValueError('Uninstall was interrupted; rerun uninstall before restoring')
-        if run_id != marker['run']:
-            raise ValueError('Only the latest completed uninstall snapshot can be restored')
-        metadata, _, values = self.recovery(marker)
-        for name in OWNED_FILES:
-            target = self.target(name)
-            if target.exists() or target.is_symlink():
-                raise ValueError(f'Path appeared after uninstall; review it before restoring: {target}')
-        bundle = self.system_root / BUNDLE.lstrip('/')
-        if bundle.exists() or bundle.is_symlink():
-            raise ValueError(f'Bundle appeared after uninstall; review it before restoring: {bundle}')
-        self.require_stopped(require_missing=True)
-        self.private_directory(out, create=True)
-        for name, data in values.items():
-            write_private(out / name, data)
-        return metadata['container']
+        for service in marker['reload']:
+            # try-restart never starts a service that has since become inactive.
+            self.run(['systemctl', 'try-restart', service], check=True, timeout=30)
+        marker_path.unlink()
+        sync_directory(marker_path.parent)
+        return True
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('check-install', 'prepare-revoke', 'record', 'record-config', 'uninstall', 'prepare-restore'))
+    parser.add_argument('action', choices=('check-install', 'prepare-revoke', 'record', 'record-host-files', 'record-config', 'uninstall'))
     parser.add_argument('--container', action='store_true')
+    parser.add_argument('--apt-source-created', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--applied', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--run')
-    parser.add_argument('--backup')
-    parser.add_argument('--out', type=Path)
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run lifecycle operations with sudo/root')
@@ -436,25 +479,19 @@ def main():
             parser.error('prepare-revoke requires --run')
         lifecycle.prepare_revoke(args.run)
     elif args.action == 'record':
-        lifecycle.record(args.container)
+        lifecycle.record(args.container, apt_source_created=args.apt_source_created)
+    elif args.action == 'record-host-files':
+        lifecycle.record_host_files(applied=args.applied)
     elif args.action == 'record-config':
         lifecycle.record_config()
     elif args.action == 'uninstall':
-        if not args.run:
-            parser.error('uninstall requires --run')
-        run_id = lifecycle.uninstall(args.run)
-        print(f'Proxy removed. Recovery snapshot: {lifecycle.backup_root / run_id}')
-        print('Retained: private settings/credentials, UFW/SSH rules (including proxy allowances),')
-        print('Unbound, fail2ban, BBR settings, packages, service account, logs and backups.')
-        print(f'Restore from a trusted checkout: sudo ./warp-pipe-proxy.sh restore --backup {run_id}')
-    else:
-        if not args.backup or args.out is None:
-            parser.error('prepare-restore requires --backup and --out')
-        print(int(lifecycle.prepare_restore(args.backup, args.out)))
+        changed = lifecycle.uninstall()
+        print('Proxy and project data deleted; no backup was created.' if changed else 'No installed proxy or project data remains.')
+        print('Shared packages, service account, APT key, SSH/firewall policy and system journal are retained.')
 
 
 if __name__ == '__main__':
     try:
         main()
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        raise SystemExit(f'ERROR: {error}. Inspect the retained recovery data before retrying.')
+        raise SystemExit(f'ERROR: {error}. If uninstall was interrupted, rerun it from a trusted checkout.')

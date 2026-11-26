@@ -211,6 +211,55 @@ protect_listeners() {
     done
 }
 
+# После полного удаления пакеты могут остаться. При новой установке допустимы
+# только их неизменённые стандартные конфиги; чужую настройку не присваиваем.
+check_pristine_package_tree() {
+    python3 - "$1" "$2" <<'PYTHON'
+import hashlib
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+package = sys.argv[2]
+try:
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise ValueError(f'unsafe configuration directory: {root}')
+    result = subprocess.run(['dpkg-query', '-W', '-f=${Conffiles}\n', package],
+                            check=True, capture_output=True, text=True, timeout=30)
+    expected = {}
+    for line in result.stdout.splitlines():
+        match = re.fullmatch(r' (/\S+) ([0-9a-f]{32})', line)
+        if match and root in Path(match[1]).parents:
+            expected[Path(match[1])] = match[2]
+    if not expected:
+        raise ValueError('package has no recorded conffiles in this directory')
+    seen = set()
+    for directory, subdirectories, files in os.walk(root, followlinks=False):
+        for name in subdirectories:
+            path = Path(directory) / name
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                raise ValueError(f'unsafe configuration directory: {path}')
+        for name in files:
+            path = Path(directory) / name
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022 or path not in expected
+                    or hashlib.md5(path.read_bytes()).hexdigest() != expected[path]):
+                raise ValueError(f'custom or changed configuration: {path}')
+            seen.add(path)
+    if set(expected) != seen:
+        raise ValueError('packaged configuration files are missing')
+except (OSError, ValueError, subprocess.SubprocessError) as error:
+    raise SystemExit(f'Existing {root} is not pristine {package} configuration; '
+                     f'refusing to overwrite an unmanaged installation ({error})')
+PYTHON
+}
+
 # Фиксируем файлы, активность и автозапуск служб непосредственно перед применением изменений.
 begin_transaction() {
     local path service state
@@ -229,7 +278,6 @@ begin_transaction() {
         "$ROOT/summary.json"
         "$ROOT/installed"
         "$ROOT/ownership.json"
-        "$ROOT/uninstalled.json"
         "$ROOT/revocation-pending.json"
     )
     # Откат не должен менять firewall и fail2ban, которыми этот запуск не управляет.
@@ -303,6 +351,7 @@ configure_bbr() (
     if sysctl -w net.core.default_qdisc=fq && sysctl -w net.ipv4.tcp_congestion_control=bbr; then
         if printf 'tcp_bbr\n' > /etc/modules-load.d/warp-pipe-proxy.conf &&
            printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' > /etc/sysctl.d/90-warp-pipe-proxy.conf; then
+            : > "$STAGE/bbr-applied" || exit 1
             log SUCCESS 'BBR enabled for new TCP connections'
             exit 0
         fi
@@ -340,7 +389,7 @@ install_cli_command() {
     local file bundle=/usr/local/lib/warp-pipe-proxy
     check_cli_paths
     install -d -m 755 "$STAGE/cli"
-    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py activity.py lifecycle.py; do
+    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py activity.py lifecycle.py uninstall_firewall.py; do
         install -m 644 "$BASE/$file" "$STAGE/cli/$file"
     done
     install -d -m 755 /usr/local/bin "$bundle"

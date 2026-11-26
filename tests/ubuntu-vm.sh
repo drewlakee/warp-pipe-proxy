@@ -50,7 +50,7 @@ guest ufw status | grep -q '^Status: inactive'
 ssh_check
 
 guest mkdir -p /root/project
-tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py activity.py probe.py lifecycle.py | guest tar -xf - -C /root/project
+tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py activity.py probe.py lifecycle.py uninstall_firewall.py | guest tar -xf - -C /root/project
 install_proxy() { guest bash /root/project/warp-pipe-proxy.sh install; }
 install_proxy
 guest cat /usr/bin/sing-box > "$tmp/sing-box"
@@ -204,23 +204,62 @@ guest sha256sum --check < "$tmp/state"
 check_ssh_access
 request laptop https://example.com
 
-# Removal and recovery preserve host policy, current keys, and revocations.
-guest sha256sum /etc/warp-pipe-proxy/credentials.json > "$tmp/recovery-state"
-guest bash /root/project/warp-pipe-proxy.sh uninstall
-guest test ! -e /usr/local/bin/warp-pipe-proxy
-guest test ! -e /etc/sing-box/config.json
-guest ufw show added | diff - "$tmp/rules"
+# Uninstall permanently removes project data without creating another backup or
+# log, while preserving administrator configuration and restricted SSH access.
+old_key=$(guest python3 -c 'import json; print(json.load(open("/etc/warp-pipe-proxy/credentials.json"))["public_key"])')
+guest sha256sum /etc/unbound/unbound.conf.d/fixture.conf > "$tmp/foreign-config"
+guest warp-pipe-proxy uninstall
+assert_purged() {
+    guest python3 - <<'PY'
+from pathlib import Path
+paths = (
+    '/etc/warp-pipe-proxy', '/etc/sing-box/config.json',
+    '/etc/systemd/system/warp-pipe-proxy.service',
+    '/usr/local/bin/warp-pipe-proxy', '/usr/local/lib/warp-pipe-proxy',
+    '/var/lib/warp-pipe-proxy', '/var/lib/warp-pipe-proxy-installer',
+    '/var/log/warp-pipe-proxy-installer', '/var/lib/warp-pipe-proxy-uninstalling.json',
+    '/etc/unbound/unbound.conf.d/warp-pipe-proxy.conf',
+    '/etc/fail2ban/jail.d/warp-pipe-proxy.local',
+    '/etc/sysctl.d/90-warp-pipe-proxy.conf', '/etc/modules-load.d/warp-pipe-proxy.conf',
+    '/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources',
+)
+remaining = [name for name in paths if Path(name).exists() or Path(name).is_symlink()]
+if remaining:
+    raise SystemExit('Uninstall left project files: ' + ', '.join(remaining))
+PY
+}
+assert_purged
+guest sha256sum --check < "$tmp/foreign-config"
+grep -v "comment 'warp-pipe-proxy Reality'" "$tmp/rules" > "$tmp/retained-rules"
+guest ufw show added | diff - "$tmp/retained-rules"
+guest ufw status | grep -q '^Status: active'
 ssh_check
-recovery=$(guest python3 -c 'import json; print(json.load(open("/etc/warp-pipe-proxy/uninstalled.json"))["run"])')
 guest bash /root/project/warp-pipe-proxy.sh uninstall
-guest bash /root/project/warp-pipe-proxy.sh restore --backup "$recovery"
-guest sha256sum --check < "$tmp/recovery-state"
-guest ufw show added | diff - "$tmp/rules"
-check_ssh_access
-request laptop https://example.com
-request phone https://example.com deny
-if guest bash /root/project/warp-pipe-proxy.sh restore --backup "$recovery"; then
-    echo 'A consumed recovery snapshot was accepted unexpectedly' >&2
+assert_purged
+
+# Explicitly remove this test's own DNS fixture. Shared package defaults may be
+# reused, but custom administrator configuration must never be adopted silently.
+guest rm /etc/unbound/unbound.conf.d/fixture.conf
+guest systemctl restart unbound
+if guest bash /root/project/warp-pipe-proxy.sh restore; then
+    echo 'The removed restore command was accepted unexpectedly' >&2
     exit 1
 fi
-echo 'PASS: firewall initialization/preservation, external VLESS, reboot, revocation during outage, rollback, uninstall and restore'
+assert_purged
+# The retained active firewall is administrator-owned now; explicitly allow the
+# new proxy installation as its administrator, then verify that policy is kept.
+guest ufw allow 10443/tcp comment 'VM administrator proxy allowance'
+guest ufw show added > "$tmp/new-policy"
+install_proxy
+guest ufw show added | diff - "$tmp/new-policy"
+new_key=$(guest python3 -c 'import json; print(json.load(open("/etc/warp-pipe-proxy/credentials.json"))["public_key"])')
+[[ $old_key != "$new_key" ]]
+guest warp-pipe-proxy device-list > "$tmp/new-devices"
+test ! -s "$tmp/new-devices"
+check_ssh_access
+request laptop https://example.com deny
+request phone https://example.com deny
+guest warp-pipe-proxy device-add --device fresh
+export_profile fresh
+request fresh https://example.com
+echo 'PASS: firewall initialization/preservation, external VLESS, reboot, revocation during outage, rollback, permanent uninstall and fresh reinstall'

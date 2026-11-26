@@ -1,6 +1,8 @@
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +22,47 @@ log() {{ echo "$*"; }}
 {setup}
 {body}
 '''], capture_output=True, text=True)
+
+    def pristine_package_check(self, change=None, query_fails=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'etc/unbound'
+            config.mkdir(parents=True)
+            source = config / 'unbound.conf'
+            source.write_text('package default configuration\n')
+            checksum = hashlib.md5(source.read_bytes()).hexdigest()
+            metadata = root / 'conffiles'
+            metadata.write_text(f' {source} {checksum}\n')
+            commands = root / 'bin'
+            commands.mkdir()
+            query = commands / 'dpkg-query'
+            query.write_text('#!/bin/sh\n' + ('exit 1\n' if query_fails else f'cat {shlex.quote(str(metadata))}\n'))
+            query.chmod(0o700)
+            if change:
+                change(config, source)
+            return self.shell(f'check_pristine_package_tree {shlex.quote(str(config))} unbound',
+                              f'export PATH={shlex.quote(str(commands))}:"$PATH"')
+
+    def test_reinstall_accepts_only_pristine_dependency_configuration(self):
+        result = self.pristine_package_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        changes = (
+            lambda root, source: source.write_text('administrator configuration\n'),
+            lambda root, source: (root / 'custom.conf').write_text('new configuration\n'),
+            lambda root, source: (root / 'linked.conf').symlink_to(source),
+            lambda root, source: source.chmod(0o666),
+            lambda root, source: source.unlink(),
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                result = self.pristine_package_check(change)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('refusing to overwrite an unmanaged installation', result.stderr)
+
+    def test_reinstall_refuses_unverifiable_package_configuration(self):
+        result = self.pristine_package_check(query_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not pristine unbound configuration', result.stderr)
 
     def test_individual_service_failure(self):
         result = self.shell('wait_services', '''
@@ -70,6 +113,34 @@ configure_bbr
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('net.ipv4.tcp_congestion_control=original', result.stdout)
             self.assertIn('installation remains successful', result.stdout)
+
+    def test_bbr_receipt_requires_both_persistent_files(self):
+        for succeeded in (True, False):
+            with self.subTest(succeeded=succeeded), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for folder in ('etc/modules-load.d', 'etc/sysctl.d', 'stage', 'backup'):
+                    (root / folder).mkdir(parents=True)
+                runtime = (BASE / 'runtime.sh').read_text().replace('/etc/', directory + '/etc/')
+                path = root / 'runtime.sh'
+                path.write_text(runtime)
+                if not succeeded:
+                    # A failed persistent write must not authorize adopting
+                    # preexisting host configuration as newly owned.
+                    (root / 'etc/sysctl.d/90-warp-pipe-proxy.conf').mkdir()
+                result = subprocess.run(['bash', '-c', f'''
+set -Eeuo pipefail
+source "{path}"
+trap - EXIT
+STAGE={shlex.quote(str(root / 'stage'))}
+BACKUP={shlex.quote(str(root / 'backup'))}
+log() {{ :; }}
+systemd-detect-virt() {{ return 1; }}
+modprobe() {{ return 0; }}
+sysctl() {{ if [[ $1 == -n ]]; then echo original; fi; return 0; }}
+configure_bbr
+'''], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root / 'stage/bbr-applied').exists(), succeeded)
 
     def test_exit_failure_restores_files_and_removes_new_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -229,7 +300,7 @@ exit 17
             (root / 'runtime.sh').write_text(runtime)
             source = root / 'source'
             source.mkdir()
-            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py', 'activity.py', 'lifecycle.py'):
+            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py', 'activity.py', 'lifecycle.py', 'uninstall_firewall.py'):
                 (source / name).write_text((BASE / name).read_text())
             stage = root / 'stage'
             stage.mkdir()
