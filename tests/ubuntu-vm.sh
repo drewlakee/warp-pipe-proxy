@@ -44,29 +44,39 @@ ssh_check() {
     ssh -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 \
         -o UserKnownHostsFile="$tmp/known_hosts" "ubuntu@$server" true
 }
-guest ufw allow proto tcp from "$source_ip" to any port 22
-guest ufw --force enable
+# First exercise automatic initialization on an inactive, empty firewall,
+# including the DHCP client in this cloud image.
+guest ufw status | grep -q '^Status: inactive'
 ssh_check
 
 guest mkdir -p /root/project
-tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py activity.py probe.py | guest tar -xf - -C /root/project
+tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py activity.py probe.py lifecycle.py uninstall_firewall.py | guest tar -xf - -C /root/project
 install_proxy() { guest bash /root/project/warp-pipe-proxy.sh install; }
 install_proxy
 guest cat /usr/bin/sing-box > "$tmp/sing-box"
 chmod 700 "$tmp/sing-box"
 export PATH="$tmp:$PATH"
 
+ssh_restricted=no
 check_ssh_access() {
     ssh_check
-    lxc exec "$other" -- python3 - "$server" <<'PY'
+    lxc exec "$other" -- python3 - "$server" "$ssh_restricted" <<'PY'
 import socket, sys
-host = sys.argv[1]
+host, restricted = sys.argv[1:]
 with socket.create_connection((host, 10443), timeout=5):
     pass
-with socket.create_connection((host, 22), timeout=5) as client:
-    with client.makefile('rb') as greeting:
-        if not greeting.readline(255).startswith(b'SSH-'):
-            raise SystemExit('Expected an SSH greeting on port 22 from the second node')
+try:
+    client = socket.create_connection((host, 22), timeout=3)
+except OSError:
+    if restricted != 'yes':
+        raise
+else:
+    with client:
+        if restricted == 'yes':
+            raise SystemExit('Installer widened the source restriction on SSH')
+        with client.makefile('rb') as greeting:
+            if not greeting.readline(255).startswith(b'SSH-'):
+                raise SystemExit('Expected SSH on a newly initialized firewall')
 PY
 }
 
@@ -96,7 +106,15 @@ guest warp-pipe-proxy device-add --device laptop
 export_profile laptop
 check_ssh_access
 request laptop https://example.com
+# Now establish an administrator policy and verify reinstallation does not
+# broaden SSH or change any existing UFW rule. The proxy allowance already exists.
+guest ufw allow proto tcp from "$source_ip" to any port 22
+guest ufw --force delete allow 22/tcp comment 'warp-pipe-proxy SSH preservation'
+ssh_restricted=yes
+guest ufw show added > "$tmp/existing-policy"
 install_proxy
+guest ufw show added | diff - "$tmp/existing-policy"
+check_ssh_access
 request laptop https://example.com
 before=$(guest cat /proc/sys/kernel/random/boot_id)
 lxc restart "$name"
@@ -152,7 +170,18 @@ for _ in {1..20}; do
     sleep 1
 done
 guest grep -Eq "$phone_event" /run/phone-activity
-guest warp-pipe-proxy device-revoke --device phone
+# External probe failure must not restore the revoked device. Imports still
+# work so argument validation itself does not abort the command.
+guest cp /usr/local/lib/warp-pipe-proxy/probe.py /root/probe-cli-original.py
+guest python3 - <<'PY'
+from pathlib import Path
+path = Path('/usr/local/lib/warp-pipe-proxy/probe.py')
+source = path.read_text()
+path.write_text(source.replace("    probe(Path('/etc/warp-pipe-proxy'))", "    raise SystemExit('VM test: simulated external probe outage')"))
+PY
+guest warp-pipe-proxy device-revoke --device phone > "$tmp/revoke.log" 2>&1
+grep -Fq 'Device remains revoked' "$tmp/revoke.log"
+guest mv /root/probe-cli-original.py /usr/local/lib/warp-pipe-proxy/probe.py
 guest systemctl stop warp-activity-test
 guest warp-pipe-proxy activity --device phone > "$tmp/revoked-activity"
 grep -Eq "$phone_event" "$tmp/revoked-activity"
@@ -174,4 +203,63 @@ guest ufw show added | diff - "$tmp/rules"
 guest sha256sum --check < "$tmp/state"
 check_ssh_access
 request laptop https://example.com
-echo 'PASS: external VLESS, SSH access, reboot, local subnet policy, revocation and rollback'
+
+# Uninstall permanently removes project data without creating another backup or
+# log, while preserving administrator configuration and restricted SSH access.
+old_key=$(guest python3 -c 'import json; print(json.load(open("/etc/warp-pipe-proxy/credentials.json"))["public_key"])')
+guest sha256sum /etc/unbound/unbound.conf.d/fixture.conf > "$tmp/foreign-config"
+guest warp-pipe-proxy uninstall
+assert_purged() {
+    guest python3 - <<'PY'
+from pathlib import Path
+paths = (
+    '/etc/warp-pipe-proxy', '/etc/sing-box/config.json',
+    '/etc/systemd/system/warp-pipe-proxy.service',
+    '/usr/local/bin/warp-pipe-proxy', '/usr/local/lib/warp-pipe-proxy',
+    '/var/lib/warp-pipe-proxy', '/var/lib/warp-pipe-proxy-installer',
+    '/var/log/warp-pipe-proxy-installer', '/var/lib/warp-pipe-proxy-uninstalling.json',
+    '/etc/unbound/unbound.conf.d/warp-pipe-proxy.conf',
+    '/etc/fail2ban/jail.d/warp-pipe-proxy.local',
+    '/etc/sysctl.d/90-warp-pipe-proxy.conf', '/etc/modules-load.d/warp-pipe-proxy.conf',
+    '/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources',
+)
+remaining = [name for name in paths if Path(name).exists() or Path(name).is_symlink()]
+if remaining:
+    raise SystemExit('Uninstall left project files: ' + ', '.join(remaining))
+PY
+}
+assert_purged
+guest sha256sum --check < "$tmp/foreign-config"
+grep -v "comment 'warp-pipe-proxy Reality'" "$tmp/rules" > "$tmp/retained-rules"
+guest ufw show added | diff - "$tmp/retained-rules"
+guest ufw status | grep -q '^Status: active'
+ssh_check
+guest bash /root/project/warp-pipe-proxy.sh uninstall
+assert_purged
+
+# Explicitly remove this test's own DNS fixture. Shared package defaults may be
+# reused, but custom administrator configuration must never be adopted silently.
+guest rm /etc/unbound/unbound.conf.d/fixture.conf
+guest systemctl restart unbound
+if guest bash /root/project/warp-pipe-proxy.sh restore; then
+    echo 'The removed restore command was accepted unexpectedly' >&2
+    exit 1
+fi
+assert_purged
+# The retained active firewall is administrator-owned now; explicitly allow the
+# new proxy installation as its administrator, then verify that policy is kept.
+guest ufw allow 10443/tcp comment 'VM administrator proxy allowance'
+guest ufw show added > "$tmp/new-policy"
+install_proxy
+guest ufw show added | diff - "$tmp/new-policy"
+new_key=$(guest python3 -c 'import json; print(json.load(open("/etc/warp-pipe-proxy/credentials.json"))["public_key"])')
+[[ $old_key != "$new_key" ]]
+guest warp-pipe-proxy device-list > "$tmp/new-devices"
+test ! -s "$tmp/new-devices"
+check_ssh_access
+request laptop https://example.com deny
+request phone https://example.com deny
+guest warp-pipe-proxy device-add --device fresh
+export_profile fresh
+request fresh https://example.com
+echo 'PASS: firewall initialization/preservation, external VLESS, reboot, revocation during outage, rollback, permanent uninstall and fresh reinstall'

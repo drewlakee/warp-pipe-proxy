@@ -5,6 +5,7 @@ set -Eeuo pipefail
 umask 077
 # Комментарии русские, но сообщения скрипта и системных утилит — английские.
 export LC_ALL=C
+export PYTHONDONTWRITEBYTECODE=1
 BASE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 MODE=''
 CONTAINER_MODE=0
@@ -13,11 +14,12 @@ MODE_SELECTED=0
 CLI_ARGS=("$@")
 CHECK_URL=''
 DEVICE=''
+APT_SOURCE_CREATED=0
 while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
-        install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke)
+        install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke|uninstall)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
             MODE_SELECTED=1
@@ -68,6 +70,11 @@ case "$MODE" in
         ;;
 esac
 flock -n 9 || { echo 'Another installer is running'; exit 1; }
+# Удаление не создаёт новый журнал или резервную копию и не запускает откат.
+# Python загружает нужные модули до удаления установленной команды и её файлов.
+if [[ $MODE == uninstall ]]; then
+    exec python3 "$BASE/lifecycle.py" uninstall
+fi
 install -d -m 700 /var/log/warp-pipe-proxy-installer
 RUN=$(date -u +%Y%m%dT%H%M%SZ)-$$
 LOG=/var/log/warp-pipe-proxy-installer/$RUN.log
@@ -110,7 +117,12 @@ stage() {
 on_error() {
     local status=$1 line=$2
     banner "ERROR | $CURRENT_STAGE" >&2
-    log ERROR "FAILED line=$line exit=$status. See $LOG. Managed configuration will be rolled back if application has started; packages and generated credentials are retained." >&2
+    log ERROR "FAILED line=$line exit=$status. See $LOG." >&2
+    if [[ $MODE == device-revoke ]]; then
+        log ERROR 'An incomplete applied revocation leaves the proxy stopped; revoked access is not rolled back. Inspect the recovery instructions below.' >&2
+    else
+        log ERROR 'Managed configuration will be rolled back if application has started; packages and generated credentials are retained.' >&2
+    fi
     exit "$status"
 }
 trap 'on_error "$?" "$LINENO"' ERR
@@ -148,17 +160,18 @@ check_installation_prerequisites() {
         log WARN 'Configure access restrictions on the host and publish only the required container ports'
     fi
     firewall_preflight
-    if command -v iptables >/dev/null && command -v ufw >/dev/null; then
-        firewall_backend_check
-    fi
+    firewall_backend_check
     for helper in configure.py probe.py; do
         [[ -f $BASE/$helper ]] || { log ERROR "$helper must be next to warp-pipe-proxy.sh"; exit 1; }
     done
     if [[ ! -e $ROOT/managed ]]; then
-        local unmanaged_paths=(/etc/sing-box /etc/unbound)
-        if (( ! CONTAINER_MODE )); then unmanaged_paths+=(/etc/fail2ban); fi
-        for item in "${unmanaged_paths[@]}"; do
-            [[ ! -e $item ]] || { log ERROR "Existing $item found: refusing to overwrite an unmanaged installation"; exit 1; }
+        [[ ! -e /etc/sing-box && ! -L /etc/sing-box ]] || { log ERROR 'Existing /etc/sing-box found: refusing to overwrite an unmanaged installation'; exit 1; }
+        local dependencies=(unbound)
+        if (( ! CONTAINER_MODE )); then dependencies+=(fail2ban); fi
+        for item in "${dependencies[@]}"; do
+            if [[ -e /etc/$item || -L /etc/$item ]]; then
+                check_pristine_package_tree "/etc/$item" "$item"
+            fi
         done
     fi
     export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
@@ -238,6 +251,7 @@ Enabled: yes
 Signed-By: /etc/apt/keyrings/sagernet.asc
 EOF
         chmod 644 /etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources
+        APT_SOURCE_CREATED=1
         apt-get update
         apt-get install -y sing-box
     fi
@@ -386,29 +400,38 @@ apply_validated_configuration() {
     wait_services
 }
 
-# Сначала сохраняем SSH-доступ; существующие правила UFW не сбрасываем.
+# Существующий firewall принадлежит администратору. Правила создаём только
+# при первой настройке: отсутствие активной и сохранённой политики проверено выше.
 configure_firewall() {
     if (( CONTAINER_MODE )); then
         stage 'Skipping container firewall management'
         log WARN 'UFW is not managed in container mode; host firewall must protect published ports'
         return 0
     fi
-    local port
-    stage 'Configuring UFW firewall and opening ports'
-    log 'Applying UFW rules without resetting existing rules'
+    local port expected_ufw=${UFW_ACTIVE:-}
+    stage 'Inspecting firewall policy'
+    # Если состояние изменилось после снимка, новый запуск должен заново
+    # оценить политику. Не применяем правила с устаревшим планом отката.
+    firewall_backend_check
+    if [[ -n $expected_ufw && $expected_ufw != "$UFW_ACTIVE" ]]; then
+        log ERROR 'UFW state changed during installation; refusing to apply a stale firewall plan'
+        return 1
+    fi
+    if [[ $UFW_ACTIVE == yes ]]; then
+        log 'Existing active UFW preserved: SSH restrictions, proxy rules and default policies are unchanged'
+        log WARN "Allow inbound TCP $(read_setting vless_port) in the existing firewall policy if needed; local checks do not verify external access"
+        return 0
+    fi
+    log 'No existing firewall policy found; initializing UFW for SSH and VLESS'
     # Флаг устанавливаем до первой команды UFW, чтобы откат обработал и частичное применение.
     FIREWALL_CHANGED=1
     for port in $SSH_PORTS; do
         ufw allow "$port/tcp" comment 'warp-pipe-proxy SSH preservation'
     done
-    log 'Removing legacy installer-managed SOCKS firewall rules'
-    python3 "$BASE/configure.py" remove-legacy-socks-rules
     ufw allow "$(read_setting vless_port)/tcp" comment 'warp-pipe-proxy Reality'
-    if [[ $UFW_ACTIVE == no ]]; then
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw --force enable
-    fi
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw --force enable
 }
 
 # Сохраняем результаты только после проверок; затем отключаем откат конфигураций.
@@ -418,6 +441,10 @@ save_installation_results() {
     touch "$ROOT/installed"
     python3 "$BASE/configure.py" summary > "$ROOT/summary.json"
     install_cli_command
+    local lifecycle_args=(record)
+    if (( CONTAINER_MODE )); then lifecycle_args+=(--container); fi
+    if (( APT_SOURCE_CREATED )); then lifecycle_args+=(--apt-source-created); fi
+    python3 "$BASE/lifecycle.py" "${lifecycle_args[@]}"
     # Все обязательные проверки завершены, последующие ошибки не откатывают рабочую установку.
     TRANSACTION=0
 }
@@ -426,6 +453,9 @@ save_installation_results() {
 finish_installation() {
     stage 'Configuring TCP BBR (optional)'
     configure_bbr || log WARN 'BBR skipped after an optional optimization error'
+    if [[ -f $STAGE/bbr-applied ]]; then
+        python3 "$BASE/lifecycle.py" record-host-files --applied
+    fi
     rm -rf -- "$STAGE"
     banner 'DONE | Installation and local checks completed'
     log SUCCESS 'SUCCESS: VLESS Reality configured'
@@ -446,6 +476,7 @@ finish_installation() {
 
 # Вызываем этапы обычными командами, не в условиях if/&&: иначе Bash может отключить errexit внутри функций.
 run_installation() {
+    python3 "$BASE/lifecycle.py" check-install
     check_cli_paths
     check_installation_prerequisites
     backup_existing_configuration

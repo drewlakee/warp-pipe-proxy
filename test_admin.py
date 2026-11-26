@@ -11,6 +11,15 @@ import test_configure
 
 
 class AdminTests(unittest.TestCase):
+    def test_uninstall_has_no_backup_or_restore_mode(self):
+        run = '20261126T120000Z-1234'
+        self.assertEqual(admin.parse_args(['uninstall']).command, 'uninstall')
+        for args in (['restore'], ['restore', '--backup', run],
+                     ['uninstall', '--backup', run], ['uninstall', '--container'],
+                     ['uninstall', '--device', 'laptop']):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                admin.parse_args(args)
+
     def test_rejects_incompatible_options_and_bad_urls(self):
         for args in [('install', '--url', 'https://example.com'), ('logs', '--endpoint', '127.0.0.1'),
                      ('doctor', '--url', 'file:///etc/passwd'), ('doctor', '--url', 'https://user:pass@example.com'),
