@@ -14,9 +14,18 @@ class AdminTests(unittest.TestCase):
     def test_rejects_incompatible_options_and_bad_urls(self):
         for args in [('install', '--url', 'https://example.com'), ('logs', '--endpoint', '127.0.0.1'),
                      ('doctor', '--url', 'file:///etc/passwd'), ('doctor', '--url', 'https://user:pass@example.com'),
-                     ('client-profile', '--port', '0'), ('client-profile', '--endpoint', 'bad host')]:
+                     ('client-profile', '--device', 'default', '--port', '0'), ('client-profile', '--device', 'default', '--endpoint', 'bad host')]:
             with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 admin.parse_args(args)
+
+    def test_exports_require_an_explicit_device(self):
+        for command in ('client-qr', 'client-config', 'client-profile'):
+            with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as exit_status:
+                    admin.parse_args([command])
+                self.assertEqual(exit_status.exception.code, 2)
+                self.assertIn(f'{command} requires --device NAME', err.getvalue())
+                self.assertEqual(admin.parse_args([command, '--device', 'phone']).device, 'phone')
 
     def test_export_overrides_only_client_endpoint(self):
         fixture = test_configure.ConfigureTests()
@@ -27,7 +36,7 @@ class AdminTests(unittest.TestCase):
             (root / 'credentials.json').write_text(json.dumps(fixture.credentials))
             before = (root / 'settings.json').read_bytes()
             output = io.StringIO()
-            with patch.object(admin, 'ROOT', root), patch('sys.argv', ['admin.py', 'client-profile', '--endpoint', '192.168.1.5', '--port', '443']), contextlib.redirect_stdout(output):
+            with patch.object(admin, 'ROOT', root), patch('sys.argv', ['admin.py', 'client-profile', '--device', 'default', '--endpoint', '192.168.1.5', '--port', '443']), contextlib.redirect_stdout(output):
                 self.assertEqual(admin.main(), 0)
             profile = json.loads(output.getvalue())
             outbound = profile['outbounds'][0]
@@ -47,7 +56,7 @@ class AdminTests(unittest.TestCase):
                 (root / (name + '.json')).write_text(json.dumps(value))
             original = (root / 'settings.json').read_bytes()
             with patch.object(admin, 'ROOT', root), patch('sys.argv', [
-                    'admin.py', 'client-qr', '--endpoint', '2001:db8::1', '--port', '443']), patch.object(
+                    'admin.py', 'client-qr', '--device', 'default', '--endpoint', '2001:db8::1', '--port', '443']), patch.object(
                     admin.shutil, 'which', return_value='/usr/bin/qrencode'), patch.object(
                     admin.subprocess, 'run') as run, contextlib.redirect_stderr(io.StringIO()):
                 run.return_value.returncode = 0

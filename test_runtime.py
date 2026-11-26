@@ -197,7 +197,7 @@ exit 17
             (root / 'runtime.sh').write_text(runtime)
             source = root / 'source'
             source.mkdir()
-            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py'):
+            for name in ('warp-pipe-proxy.sh', 'runtime.sh', 'logging.sh', 'configure.py', 'probe.py', 'admin.py', 'activity.py'):
                 (source / name).write_text((BASE / name).read_text())
             stage = root / 'stage'
             stage.mkdir()

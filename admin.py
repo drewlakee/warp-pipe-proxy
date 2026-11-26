@@ -8,6 +8,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+import activity
 import configure
 import probe
 
@@ -16,20 +17,30 @@ ROOT = Path('/etc/warp-pipe-proxy')
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog='warp-pipe-proxy.sh', description='Warp Pipe Proxy: install, inspect and troubleshoot VLESS Reality')
-    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'client-config', 'client-profile', 'client-qr', 'rotate-keys'])
+    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'activity', 'client-config', 'client-profile', 'client-qr', 'rotate-keys',
+                                           'device-add', 'device-revoke', 'device-list'])
     parser.add_argument('--container', action='store_true', help='Do not manage host firewall or fail2ban')
     parser.add_argument('--url', help='HTTP(S) site to compare directly and through VLESS; no redirects followed')
     parser.add_argument('--endpoint', help='Override client server IP (including private LAN IP); does not change server settings')
+    parser.add_argument('--device', metavar='NAME', help='Device name for access changes, client exports or activity')
     parser.add_argument('--port', type=int, help='Override published client port')
     parser.add_argument('--follow', action='store_true', help='Follow new journal entries')
     parser.add_argument('--since', help='Journal start time, e.g. "10 minutes ago"')
     parser.add_argument('--filter', help='Literal journal substring, e.g. destination IP or connection ID')
     parser.add_argument('--validate-only', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    device_commands = ('device-add', 'device-revoke', 'client-profile', 'client-config', 'client-qr')
     for names, commands in [(('url',), ('check', 'doctor')), (('endpoint', 'port'), ('client-profile', 'client-qr')),
-                            (('follow', 'since', 'filter'), ('logs',))]:
+                            (('device',), (*device_commands, 'activity')),
+                            (('follow', 'since'), ('logs', 'activity')), (('filter',), ('logs',))]:
         if args.command not in commands and any(getattr(args, name) not in (None, False) for name in names):
             parser.error(f'{", ".join(names)} only supported for {", ".join(commands)}')
+    if args.device is not None and not configure.valid_device_name(args.device):
+        parser.error('--device requires 1..32 lowercase letters, digits, hyphens or underscores')
+    if args.command in device_commands and args.device is None:
+        parser.error(f'{args.command} requires --device NAME')
+    if args.command == 'activity' and args.follow and not args.device:
+        parser.error('activity --follow requires --device NAME')
     if args.endpoint is not None:
         try:
             ipaddress.ip_address(args.endpoint)
@@ -129,10 +140,19 @@ def main():
     args = parse_args()
     if args.validate_only:
         return 0
-    if args.command in ('client-profile', 'client-qr'):
+    if args.command in ('client-profile', 'client-config', 'client-qr', 'device-list'):
         settings = json.loads((ROOT / 'settings.json').read_text())
         credentials = json.loads((ROOT / 'credentials.json').read_text())
         configure.validate(settings, credentials)
+        if args.command == 'device-list':
+            for name, value in sorted(configure.devices(credentials).items()):
+                print(name, 'active' if value else 'revoked', sep='\t')
+            return 0
+        credentials = configure.for_device(credentials, args.device)
+        if args.command == 'client-config':
+            print('VLESS Reality:')
+            print(configure.render_vless_link(settings, credentials))
+            return 0
         if args.command == 'client-qr':
             if shutil.which('qrencode') is None:
                 print('ERROR: qrencode is missing. Install it with: sudo apt-get install qrencode', file=sys.stderr)
@@ -158,6 +178,8 @@ def main():
         return 0 if status() else 1
     if args.command == 'doctor':
         return 0 if doctor(args) else 1
+    if args.command == 'activity':
+        return activity.run(ROOT, args.device, args.since, args.follow)
     if args.command == 'logs':
         return 0 if logs(args) else 1
     raise ValueError('Use warp-pipe-proxy.sh for installation and checks')

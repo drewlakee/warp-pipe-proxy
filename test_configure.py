@@ -21,6 +21,36 @@ class ConfigureTests(unittest.TestCase):
         self.credentials = {'uuid': '96051898-0bda-4891-9358-f1ef308dffab', 'socks_password': 'a'*64,
                             'short_id': 'a'*8, 'private_key': 'b'*43, 'public_key': 'c'*43}
 
+    def test_new_install_starts_without_client_devices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            keys = 'PrivateKey: ' + 'd'*43 + '\nPublicKey: ' + 'e'*43
+
+            def configure(action, *options):
+                with patch('sys.argv', ['configure.py', action, '--root', directory, *options]):
+                    module.main()
+
+            with patch.dict(os.environ, VPS_PUBLIC_IP='8.8.8.8', VPS_REALITY_HOST='www.example.com'), patch.object(
+                    module.subprocess, 'check_output', return_value=keys) as generate:
+                configure('init')
+                configure('init')
+                generate.assert_called_once()
+            credentials = json.loads((root / 'credentials.json').read_text())
+            self.assertEqual(credentials['devices'], {})
+            self.assertNotIn('uuid', credentials)
+            for action in ('render', 'render-rotated', 'device-add'):
+                with self.subTest(action=action), patch.object(module.subprocess, 'check_output', return_value=keys):
+                    stage = root / action
+                    configure(action, '--out', str(stage), '--device', 'phone')
+                    saved = json.loads((stage / 'credentials.json').read_text())
+                    names = ['phone'] if action == 'device-add' else []
+                    self.assertEqual(list(saved['devices']), names)
+                    users = json.loads((stage / 'config.json').read_text())['inbounds'][0]['users']
+                    self.assertEqual([user['name'] for user in users], [*names, '@probe'])
+                    self.assertEqual(users[-1]['uuid'], saved['probe_uuid'])
+                    self.assertFalse((stage / 'clients.txt').exists())
+                    self.assertFalse((stage / 'client-sing-box.json').exists())
+
     def test_rotated_render_preserves_source_and_updates_all_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -32,14 +62,14 @@ class ConfigureTests(unittest.TestCase):
                     module.subprocess, 'check_output', return_value='PrivateKey: ' + 'd'*43 + '\nPublicKey: ' + 'e'*43):
                 module.main()
             new = json.loads((output / 'credentials.json').read_text())
-            self.assertNotEqual(new['uuid'], self.credentials['uuid'])
+            self.assertNotEqual(new['devices']['default'], self.credentials['uuid'])
             self.assertNotEqual(new['short_id'], self.credentials['short_id'])
             self.assertEqual((root / 'credentials.json').read_bytes(), before)
             server = json.loads((output / 'config.json').read_text())
             client = json.loads((output / 'client-sing-box.json').read_text())
-            self.assertEqual(server['inbounds'][0]['users'][0]['uuid'], new['uuid'])
-            self.assertEqual(client['outbounds'][0]['uuid'], new['uuid'])
-            self.assertIn(new['uuid'], (output / 'clients.txt').read_text())
+            self.assertEqual(server['inbounds'][0]['users'][0]['uuid'], new['devices']['default'])
+            self.assertEqual(client['outbounds'][0]['uuid'], new['devices']['default'])
+            self.assertIn(new['devices']['default'], (output / 'clients.txt').read_text())
             self.assertNotIn(new['private_key'], (output / 'client-sing-box.json').read_text())
 
     def test_existing_credentials_are_not_regenerated(self):
@@ -119,7 +149,11 @@ ufw allow 10443/tcp comment 'warp-pipe-proxy Reality'
             migrated_credentials = json.loads((out/'credentials.json').read_text())
             self.assertNotIn('socks_port', migrated_settings)
             self.assertNotIn('socks_user', migrated_settings)
-            self.assertEqual(migrated_credentials, {k: v for k, v in self.credentials.items() if k != 'socks_password'})
+            self.assertEqual(migrated_credentials['devices'], {'default': self.credentials['uuid']})
+            self.assertNotEqual(migrated_credentials['probe_uuid'], self.credentials['uuid'])
+            self.assertNotIn('socks_password', migrated_credentials)
+            for key in ('private_key', 'public_key', 'short_id'):
+                self.assertEqual(migrated_credentials[key], self.credentials[key])
             self.assertEqual(json.loads((root/'credentials.json').read_text()), self.credentials)
             self.assertEqual((out/'clients.txt').stat().st_mode & 0o777, 0o600)
 

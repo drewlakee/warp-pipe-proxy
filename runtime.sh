@@ -14,7 +14,7 @@ rollback() {
     local services_to_stop=(warp-pipe-proxy)
     if (( ! CONTAINER_MODE )); then services_to_stop+=(fail2ban); fi
     services_to_stop+=(unbound)
-    if [[ ${MODE:-} == rotate-keys ]]; then services_to_stop=(warp-pipe-proxy); fi
+    if [[ ${MODE:-} == rotate-keys || ${MODE:-} == device-* ]]; then services_to_stop=(warp-pipe-proxy); fi
     for service in "${services_to_stop[@]}"; do
         systemctl stop "$service" || rollback_failed=1
     done
@@ -169,7 +169,7 @@ begin_transaction() {
     if (( ! CONTAINER_MODE )); then
         managed_paths+=(/etc/fail2ban/jail.d/warp-pipe-proxy.local /etc/ufw /etc/default/ufw)
     fi
-    if [[ ${MODE:-} == rotate-keys ]]; then
+    if [[ ${MODE:-} == rotate-keys || ${MODE:-} == device-* ]]; then
         managed_paths=(/etc/sing-box/config.json "$ROOT/credentials.json" "$ROOT/clients.txt" "$ROOT/client-sing-box.json")
     fi
     for path in "${managed_paths[@]}"; do
@@ -183,7 +183,7 @@ begin_transaction() {
     local managed_services=(unbound)
     if (( ! CONTAINER_MODE )); then managed_services+=(fail2ban); fi
     managed_services+=(sing-box warp-pipe-proxy)
-    if [[ ${MODE:-} == rotate-keys ]]; then managed_services=(warp-pipe-proxy); fi
+    if [[ ${MODE:-} == rotate-keys || ${MODE:-} == device-* ]]; then managed_services=(warp-pipe-proxy); fi
     for service in "${managed_services[@]}"; do
         # Неактивная или отсутствующая служба — допустимое исходное состояние, а не ошибка снимка.
         state=$(systemctl is-active "$service" || true)
@@ -272,7 +272,7 @@ install_cli_command() {
     local file bundle=/usr/local/lib/warp-pipe-proxy
     check_cli_paths
     install -d -m 755 "$STAGE/cli"
-    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py; do
+    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py activity.py; do
         install -m 644 "$BASE/$file" "$STAGE/cli/$file"
     done
     install -d -m 755 /usr/local/bin "$bundle"
@@ -291,8 +291,19 @@ LAUNCHER
 }
 
 
-rotate_keys() {
-    stage 'Preparing VLESS credential rotation'
+save_default_exports() {
+    local name
+    for name in clients.txt client-sing-box.json; do
+        if [[ -f $STAGE/$name ]]; then
+            install -m 600 "$STAGE/$name" "$ROOT/$name"
+        else
+            rm -f -- "$ROOT/$name"
+        fi
+    done
+}
+
+update_credentials() {
+    stage "Preparing credential change: $MODE"
     [[ -f $ROOT/installed && -f $ROOT/settings.json && -f $ROOT/credentials.json ]] || {
         log ERROR 'An existing managed installation is required'
         return 1
@@ -303,22 +314,22 @@ rotate_keys() {
     BACKUP=/var/lib/warp-pipe-proxy-installer/$RUN
     install -d -m 700 "$BACKUP"
     STAGE=$(mktemp -d /var/lib/warp-pipe-proxy-installer/rotate.XXXXXX)
-    python3 "$BASE/configure.py" render-rotated --root "$ROOT" --out "$STAGE"
+    local action=$MODE
+    if [[ $MODE == rotate-keys ]]; then action=render-rotated; fi
+    python3 "$BASE/configure.py" "$action" --root "$ROOT" --out "$STAGE" --device "${DEVICE:-}"
     sing-box check -c "$STAGE/config.json"
-    sing-box check -c "$STAGE/client-sing-box.json"
+    if [[ -f $STAGE/client-sing-box.json ]]; then sing-box check -c "$STAGE/client-sing-box.json"; fi
     begin_transaction
-    stage 'Applying new VLESS credentials'
-    log WARN 'Existing client profiles will stop working after rotation'
+    stage "Applying credential change: $MODE"
     install -m 600 "$STAGE/credentials.json" "$ROOT/credentials.json"
     install -m 640 -o root -g warp-pipe-proxy "$STAGE/config.json" /etc/sing-box/config.json
     systemctl restart warp-pipe-proxy
     stage 'Verifying authenticated VLESS traffic'
     python3 "$BASE/probe.py"
     systemctl is-active --quiet warp-pipe-proxy
-    install -m 600 "$STAGE/clients.txt" "$ROOT/clients.txt"
-    install -m 600 "$STAGE/client-sing-box.json" "$ROOT/client-sing-box.json"
+    save_default_exports
     TRANSACTION=0
-    log SUCCESS 'VLESS UUID, Reality key pair and short ID rotated'
-    log "Import the updated profile on every client: $ROOT/client-sing-box.json"
+    log SUCCESS "Credential change completed: $MODE"
+    if [[ $MODE == rotate-keys ]]; then log 'Export and import new profiles on every active device'; fi
     log "Previous credentials are retained in the root-only backup: $BACKUP"
 }

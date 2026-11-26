@@ -17,7 +17,10 @@ def main():
         subprocess.run(['python3', str(BASE / 'configure.py'), 'init', '--root', directory], check=True)
         settings = json.loads((root / 'settings.json').read_text())
         credentials = json.loads((root / 'credentials.json').read_text())
+        credentials = configure.prepare_credentials(credentials, 'device-add', 'phone')
+        phone = configure.for_device(credentials, 'phone')
         config = configure.render(settings, credentials)
+        config['inbounds'][0]['listen'] = '127.0.0.1'
         config['dns']['servers'] = [{'type': 'local', 'tag': 'unbound'}]
         path = root / 'server.json'
         path.write_text(json.dumps(config))
@@ -27,10 +30,11 @@ def main():
             try:
                 time.sleep(1)
                 probe.probe(root)
-                credentials['uuid'] = '00000000-0000-4000-8000-000000000001'
-                (root / 'credentials.json').write_text(json.dumps(credentials))
+                outbound = probe.client_outbound(settings, phone)
+                probe.request(outbound, 'https://example.com')
+                outbound['uuid'] = '00000000-0000-4000-8000-000000000001'
                 try:
-                    probe.probe(root)
+                    probe.request(outbound, 'https://example.com')
                 except subprocess.CalledProcessError:
                     print('PASS: incorrect VLESS UUID rejected')
                 else:
