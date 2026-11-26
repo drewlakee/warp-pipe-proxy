@@ -193,8 +193,13 @@ VLESS Reality authenticated HTTPS request passed
 | Проверить DNS и VLESS | `sudo warp-pipe-proxy check` | `VLESS Reality authenticated HTTPS request passed` |
 | Проверить в контейнере | `sudo warp-pipe-proxy check --container` | `[WARN] Container mode: UFW and fail2ban checks skipped; host firewall must protect published ports` |
 | Проверить сайт | `sudo warp-pipe-proxy doctor --url https://example.com` | `Direct IPv4 transport: PASS`<br>`VLESS transport passed; inspect the HTTP status above` |
+| Активность всех устройств | `sudo warp-pipe-proxy activity` | `phone  12s ago  84`<br>`tablet  -  0` |
+| Недавние обращения телефона | `sudo warp-pipe-proxy activity --device phone --since "10 minutes ago"` | `2026-11-26 14:32:08  TCP  example.com:443` |
+| Новые обращения телефона | `sudo warp-pipe-proxy activity --device phone --follow` | `2026-11-26 14:32:10  UDP  203.0.113.24:443` |
 | Следить за журналом | `sudo warp-pipe-proxy logs --follow` | `… inbound/vless[vless-reality]: [phone] inbound connection to example.com:443` |
 | Справка | `warp-pipe-proxy --help` | `usage: warp-pipe-proxy.sh [-h] [--container] …` |
+
+По умолчанию `activity` показывает время последнего обращения и число запросов на соединение для каждого профиля за последний час по данным журнала. В сводку входят и отозванные профили, и устройства с нулём запросов. Служебные проверки `@probe` пропускаются. С параметром `--device` видны время (UTC), протокол и адрес назначения, который передал клиент. Один сайт может породить несколько запросов. Режим `--follow` показывает новые события. Добавьте `--since`, чтобы сначала увидеть историю.
 
 Для отключения одного устройства достаточно `device-revoke`. Служба перезапустится, остальные устройства смогут подключиться с прежними профилями. Команда `status` проверяет службы и порт локально; доступность извне проверьте с устройства.
 

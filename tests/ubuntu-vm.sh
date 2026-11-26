@@ -49,7 +49,7 @@ guest ufw --force enable
 ssh_check
 
 guest mkdir -p /root/project
-tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py probe.py | guest tar -xf - -C /root/project
+tar -cf - warp-pipe-proxy.sh runtime.sh logging.sh configure.py admin.py activity.py probe.py | guest tar -xf - -C /root/project
 install_proxy() { guest bash /root/project/warp-pipe-proxy.sh install; }
 install_proxy
 guest cat /usr/bin/sing-box > "$tmp/sing-box"
@@ -138,8 +138,24 @@ request laptop 'http://[::1]:18081/' deny
 
 guest warp-pipe-proxy device-add --device phone
 export_profile phone
+guest warp-pipe-proxy activity > "$tmp/activity"
+grep -Eq '^laptop[[:space:]].*[[:space:]][1-9][0-9]*$' "$tmp/activity"
+grep -Eq '^phone[[:space:]]+-[[:space:]]+0$' "$tmp/activity"
+if grep -Eq '@probe|example[.]com' "$tmp/activity"; then exit 1; fi
+
+guest systemd-run --unit=warp-activity-test -p StandardOutput=file:/run/phone-activity \
+    /usr/local/bin/warp-pipe-proxy activity --device phone --since '1 hour ago' --follow
 request phone https://example.com
+phone_event=' TCP[[:space:]]+example[.]com:443$'
+for _ in {1..20}; do
+    if guest grep -Eq "$phone_event" /run/phone-activity; then break; fi
+    sleep 1
+done
+guest grep -Eq "$phone_event" /run/phone-activity
 guest warp-pipe-proxy device-revoke --device phone
+guest systemctl stop warp-activity-test
+guest warp-pipe-proxy activity --device phone > "$tmp/revoked-activity"
+grep -Eq "$phone_event" "$tmp/revoked-activity"
 request phone https://example.com deny
 request laptop https://example.com
 

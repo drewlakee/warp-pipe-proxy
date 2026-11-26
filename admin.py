@@ -8,6 +8,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+import activity
 import configure
 import probe
 
@@ -16,12 +17,12 @@ ROOT = Path('/etc/warp-pipe-proxy')
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog='warp-pipe-proxy.sh', description='Warp Pipe Proxy: install, inspect and troubleshoot VLESS Reality')
-    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'client-config', 'client-profile', 'client-qr', 'rotate-keys',
+    parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'activity', 'client-config', 'client-profile', 'client-qr', 'rotate-keys',
                                            'device-add', 'device-revoke', 'device-list'])
     parser.add_argument('--container', action='store_true', help='Do not manage host firewall or fail2ban')
     parser.add_argument('--url', help='HTTP(S) site to compare directly and through VLESS; no redirects followed')
     parser.add_argument('--endpoint', help='Override client server IP (including private LAN IP); does not change server settings')
-    parser.add_argument('--device', metavar='NAME', help='Device name for access changes and client exports')
+    parser.add_argument('--device', metavar='NAME', help='Device name for access changes, client exports or activity')
     parser.add_argument('--port', type=int, help='Override published client port')
     parser.add_argument('--follow', action='store_true', help='Follow new journal entries')
     parser.add_argument('--since', help='Journal start time, e.g. "10 minutes ago"')
@@ -30,14 +31,16 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     device_commands = ('device-add', 'device-revoke', 'client-profile', 'client-config', 'client-qr')
     for names, commands in [(('url',), ('check', 'doctor')), (('endpoint', 'port'), ('client-profile', 'client-qr')),
-                            (('device',), device_commands),
-                            (('follow', 'since', 'filter'), ('logs',))]:
+                            (('device',), (*device_commands, 'activity')),
+                            (('follow', 'since'), ('logs', 'activity')), (('filter',), ('logs',))]:
         if args.command not in commands and any(getattr(args, name) not in (None, False) for name in names):
             parser.error(f'{", ".join(names)} only supported for {", ".join(commands)}')
     if args.device is not None and not configure.valid_device_name(args.device):
         parser.error('--device requires 1..32 lowercase letters, digits, hyphens or underscores')
     if args.command in device_commands and args.device is None:
         parser.error(f'{args.command} requires --device NAME')
+    if args.command == 'activity' and args.follow and not args.device:
+        parser.error('activity --follow requires --device NAME')
     if args.endpoint is not None:
         try:
             ipaddress.ip_address(args.endpoint)
@@ -175,6 +178,8 @@ def main():
         return 0 if status() else 1
     if args.command == 'doctor':
         return 0 if doctor(args) else 1
+    if args.command == 'activity':
+        return activity.run(ROOT, args.device, args.since, args.follow)
     if args.command == 'logs':
         return 0 if logs(args) else 1
     raise ValueError('Use warp-pipe-proxy.sh for installation and checks')

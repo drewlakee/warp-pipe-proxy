@@ -272,7 +272,7 @@ install_cli_command() {
     local file bundle=/usr/local/lib/warp-pipe-proxy
     check_cli_paths
     install -d -m 755 "$STAGE/cli"
-    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py; do
+    for file in warp-pipe-proxy.sh runtime.sh logging.sh configure.py probe.py admin.py activity.py; do
         install -m 644 "$BASE/$file" "$STAGE/cli/$file"
     done
     install -d -m 755 /usr/local/bin "$bundle"

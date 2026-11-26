@@ -17,7 +17,7 @@ while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
-        install|check|status|doctor|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke)
+        install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
             MODE_SELECTED=1
@@ -43,7 +43,7 @@ else
     python3 "$BASE/admin.py" "${CLI_ARGS[@]}" --validate-only
 fi
 case "$MODE" in
-    status|doctor|logs) exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}" ;;
+    status|doctor|activity|logs) exec python3 "$BASE/admin.py" "${CLI_ARGS[@]}" ;;
 esac
 # Проверяем базовое окружение до создания файлов и запуска служб.
 [[ $EUID == 0 ]] || { echo 'Run with sudo/root'; exit 1; }
