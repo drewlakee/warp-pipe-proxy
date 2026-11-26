@@ -215,7 +215,25 @@ If writing the revoked configuration or starting the service fails, the command 
 
 ## Settings and upgrades
 
-The server IP, ports and Reality settings are in `/etc/warp-pipe-proxy/settings.json`. To allow clients to reach a private subnet, add `"allowed_private_subnets": ["192.168.50.0/24"]` to that file, using your own CIDR range. The exception applies to all devices. Apply changes with `sudo warp-pipe-proxy install` (add `--container` in a container).
+The server's source settings are in `/etc/warp-pipe-proxy/settings.json`. Edit this file as root and apply changes with `sudo warp-pipe-proxy install` (add `--container` in a container). The installer regenerates and validates service configurations before applying them. Manual edits to generated files such as `/etc/sing-box/config.json` are overwritten when configuration is reapplied. See [File layout](#file-layout) for the other files and their roles.
+
+| Field in `settings.json` | Meaning and constraints |
+| --- | --- |
+| `public_ip` | The server's public IPv4 address included in client profiles. |
+| `reality_host` | The Reality handshake server's domain name. On first install it is selected after TLS 1.3 and HTTP/2 checks. |
+| `vless_port` | The proxy's TCP port; defaults to `10443`. |
+| `dns_port` | The local Unbound port on `127.0.0.1`; defaults to `5353`. |
+| `allowed_private_subnets` | An optional list of permitted private subnets, for example `["192.168.50.0/24"]`. There are no exceptions by default; an added exception applies to all devices. |
+
+Both ports must be distinct integers in `1024..65535`; on a VPS they must also differ from the SSH ports. After changing the proxy port, update its allowance in an already active firewall, your provider's firewall and any container port mapping. After changing the public address, proxy port or Reality server, export new client profiles. The `--endpoint` and `--port` options are supported by `client-profile` and `client-qr` and change only the exported profile, not the listening service; `client-config` does not accept them.
+
+When `settings.json` is first created, you can pass `VPS_PUBLIC_IP` (your public IPv4 instead of automatic detection) and `VPS_REALITY_HOST` (a domain or space-separated list of candidates) through `sudo env`. For example:
+
+```bash
+sudo env VPS_REALITY_HOST=www.microsoft.com ./warp-pipe-proxy.sh install
+```
+
+Once `settings.json` exists, these variables do not override it: make subsequent changes in that file. Manage devices with `device-add`, `device-revoke` and `rotate-keys`; do not manually edit `credentials.json`. Reinstallation preserves existing UUIDs and Reality keys without rotating them automatically. Pass `--container` on every `install` and `check`; the saved installation mode is used automatically only when restoring an uninstall snapshot with `restore`.
 
 To upgrade, run `git pull --ff-only` in the project directory, then repeat the install command for your setup. When upgrading from the older single-UUID version, existing clients retain access. Export that UUID explicitly with `--device default`. Add any required private subnets before upgrading.
 
@@ -233,6 +251,56 @@ $ sudo warp-pipe-proxy install
 This example shows a checkout that is already up to date. After downloading a new version, run the installer from the checkout as shown above. `sudo warp-pipe-proxy install` reapplies the version already installed.
 
 </details>
+
+## File layout
+
+### Settings, keys and installer state
+
+All files in the following table are under **`/etc/warp-pipe-proxy/`**. The directory is owned by root and created with mode `0700`; its files are created with mode `0600`. `settings.json` and `credentials.json` are the source data used to generate configuration. The installer creates and maintains the other files.
+
+| File under `/etc/warp-pipe-proxy/` | Purpose |
+| --- | --- |
+| `settings.json` | Public IP, ports, Reality server and private subnet exceptions. Edit this file to change server parameters. |
+| `credentials.json` | The Reality private/public key pair, short ID, internal check UUID, and device registry with UUIDs and revocations. Managed through device commands; contains access credentials. |
+| `managed`, `installed` | Markers for a managed installation and successful completion. `uninstall` removes `installed`. |
+| `summary.json`, `tls-check.txt` | Settings summary from the last successful install and output from the initial Reality server check. These are diagnostic files, not configuration inputs. |
+| `ownership.json` | Hashes of owned proxy/CLI files and the container mode of the last successful installation. Used to verify safe removal. |
+| `uninstalled.json` | Removal state and a reference to its latest snapshot. Allows interrupted removal to resume and determines whether `restore` is permitted. |
+| `revocation-pending.json` | Marker for an incomplete revocation, with hashes of the validated intended credentials. Blocks operations that could restore old access. |
+| `clients.txt`, `client-sing-box.json` | Compatibility exports for an older installation using the `default` profile; not automatically created for a fresh installation. Contain proxy access credentials. Export current device profiles with `--device`. |
+
+Do not edit the internal markers or hashes manually. See [Management and diagnostics](#management-and-diagnostics) and [Uninstall and restore](#uninstall-and-restore) for handling snapshots and interrupted operations.
+
+### Service configurations and installed command
+
+| Path | Contents and management |
+| --- | --- |
+| `/etc/sing-box/config.json` | Generated server configuration containing the private key; `root:warp-pipe-proxy`, mode `0640`. `/etc/sing-box/` has mode `0750`. Regenerated from settings/credentials during installation and device changes. |
+| `/etc/unbound/unbound.conf.d/warp-pipe-proxy.conf` | Generated local DNS configuration; root, mode `0644`. If necessary, the installer also creates the DNSSEC trust anchor `/var/lib/unbound/root.key` from `dns-root-data`, owned by `unbound` with mode `0644`. |
+| `/etc/fail2ban/jail.d/warp-pipe-proxy.local` | Generated SSH jail using the detected `sshd` ports; root, mode `0644`. Not created or modified in container mode. |
+| `/etc/systemd/system/warp-pipe-proxy.service` | Generated service unit; root, mode `0644`. Runs sing-box as `warp-pipe-proxy` and depends on Unbound. |
+| `/usr/local/bin/warp-pipe-proxy` | Command launcher; root, mode `0755`. Uses the installed project copy, so routine management does not require the original checkout. |
+| `/usr/local/lib/warp-pipe-proxy/` | Installed shell/Python modules and the `.managed` marker; directory mode `0755`, root-owned files with mode `0644`. Updated when installing from a checkout. |
+| `/var/lib/warp-pipe-proxy/` | Working directory and home directory for the `warp-pipe-proxy` system user. Keys and settings are stored separately under `/etc/warp-pipe-proxy/`. |
+| `/etc/apt/keyrings/sagernet.asc`, `/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources` | Key and definition for the official sing-box APT repository; root, mode `0644`. Added when sing-box is not already installed. |
+| `/etc/sysctl.d/90-warp-pipe-proxy.conf`, `/etc/modules-load.d/warp-pipe-proxy.conf` | Persistent `fq`/BBR settings and `tcp_bbr` module loading. Created when this optional optimization is successfully enabled outside a container. |
+| `/etc/ufw/`, `/etc/default/ufw` | Shared UFW configuration. Initialized by the installer only when no existing firewall policy is present; an active firewall retains its own rules. |
+
+### Logs, snapshots and temporary files
+
+`<RUN>` is an identifier built from UTC time and the process ID, for example `20261126T120000Z-1234`. Log and backup directories are root-only (`0700`); logs and individual recovery files are created with mode `0600`. Copies of system files may retain their original permissions inside the private backup directory.
+
+| Path | Purpose |
+| --- | --- |
+| `/var/log/warp-pipe-proxy-installer/<RUN>.log` | Output from installation, checking or a state-changing operation. The proxy's own log is in the systemd journal: `sudo warp-pipe-proxy logs` or `sudo journalctl -u warp-pipe-proxy`. |
+| `/var/lib/warp-pipe-proxy-installer/<RUN>/` | Snapshot for a particular operation. Installation backups contain original system files with their paths, such as `etc/…`. Snapshots may contain earlier private keys and UUIDs. |
+| `/var/lib/warp-pipe-proxy-installer/<RUN>/transaction/` | Files for rolling back configuration application. Sibling files `paths`, `active` and `enabled` record paths and service activity/enablement. This is not a snapshot for the `restore` command. |
+| `/var/lib/warp-pipe-proxy-installer/<RUN>/revocation/` | Validated configuration without the revoked device, retained to finish revocation after a failure. Contains the intended settings/credentials and generated files. |
+| `/var/lib/warp-pipe-proxy-installer/<RUN>/{settings.json,credentials.json,ownership.json,recovery.json}` | The separate uninstall snapshot format: current settings, credentials and verification metadata. `restore` accepts only the latest completed snapshot referenced by `uninstalled.json`. |
+| `/var/lib/warp-pipe-proxy-installer/{stage.*,rotate.*,restore.*}` | Temporary directories for configuration preparation, credential changes and recovery validation. Removed on normal operation exit, including handled failures. |
+| `/run/lock/warp-pipe-proxy.lock` | Lock preventing concurrent installation changes or exports of intermediate credential state. |
+
+When backing up, account for both parts of the state: `/etc/warp-pipe-proxy/` and the needed snapshots under `/var/lib/warp-pipe-proxy-installer/`. The section below explains which snapshots can be used and what is retained after removal.
 
 ## Uninstall and restore
 
