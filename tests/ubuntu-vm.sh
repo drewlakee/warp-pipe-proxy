@@ -56,20 +56,17 @@ guest cat /usr/bin/sing-box > "$tmp/sing-box"
 chmod 700 "$tmp/sing-box"
 export PATH="$tmp:$PATH"
 
-check_ssh_policy() {
+check_ssh_access() {
     ssh_check
     lxc exec "$other" -- python3 - "$server" <<'PY'
 import socket, sys
 host = sys.argv[1]
 with socket.create_connection((host, 10443), timeout=5):
     pass
-try:
-    connection = socket.create_connection((host, 22), timeout=3)
-except TimeoutError:
-    pass
-else:
-    connection.close()
-    raise SystemExit('Unexpected SSH access from the second node')
+with socket.create_connection((host, 22), timeout=5) as client:
+    with client.makefile('rb') as greeting:
+        if not greeting.readline(255).startswith(b'SSH-'):
+            raise SystemExit('Expected an SSH greeting on port 22 from the second node')
 PY
 }
 
@@ -97,7 +94,7 @@ guest warp-pipe-proxy device-list > "$tmp/initial-devices"
 test ! -s "$tmp/initial-devices"
 guest warp-pipe-proxy device-add --device laptop
 export_profile laptop
-check_ssh_policy
+check_ssh_access
 request laptop https://example.com
 install_proxy
 request laptop https://example.com
@@ -108,7 +105,7 @@ for _ in {1..90}; do
     sleep 2
 done
 [[ $(guest cat /proc/sys/kernel/random/boot_id) != "$before" ]]
-check_ssh_policy
+check_ssh_access
 request laptop https://example.com
 
 # Use disposable HTTP and DNS fixtures wholly inside the guest.
@@ -159,6 +156,6 @@ grep -Fq 'Managed configuration and service states restored' "$tmp/failure.log"
 guest mv /root/probe-original.py /root/project/probe.py
 guest ufw show added | diff - "$tmp/rules"
 guest sha256sum --check < "$tmp/state"
-check_ssh_policy
+check_ssh_access
 request laptop https://example.com
-echo 'PASS: external VLESS, SSH policy, reboot, local subnet policy, revocation and rollback'
+echo 'PASS: external VLESS, SSH access, reboot, local subnet policy, revocation and rollback'

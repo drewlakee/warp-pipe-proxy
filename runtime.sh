@@ -147,28 +147,6 @@ protect_listeners() {
     done
 }
 
-prepare_ssh_firewall() {
-    if (( CONTAINER_MODE )); then return 0; fi
-    local rules peer session_port
-    rules=$(ufw show added)
-    if [[ $rules == *'warp-pipe-proxy SSH preservation'* ]]; then
-        log WARN 'Legacy unrestricted SSH rule found. Verify a new restricted SSH session before removing the old rule.'
-    fi
-    [[ $UFW_ACTIVE == no ]] || return 0
-    if grep -q '^ufw ' <<< "$rules"; then
-        log ERROR 'Inactive UFW has existing rules. Review and enable it with working SSH access before installing.'
-        return 1
-    fi
-    read -r peer _ _ session_port <<< "${SSH_CONNECTION:-}"
-    SSH_SOURCE=${VPS_SSH_SOURCE:-$peer}
-    if [[ -z ${VPS_SSH_SOURCE:-} ]] && ! grep -Fxq -- "$session_port" <<< "$SSH_PORTS"; then
-        log ERROR 'Cannot identify the SSH session. Set VPS_SSH_SOURCE to the administrator IP or subnet.'
-        return 1
-    fi
-    SSH_SOURCE=$(python3 -c 'import ipaddress, sys; print(ipaddress.ip_network(sys.argv[1], strict=True))' "$SSH_SOURCE") || return 1
-    log "Preserving SSH access from $SSH_SOURCE before enabling UFW"
-}
-
 # Фиксируем файлы, активность и автозапуск служб непосредственно перед применением изменений.
 begin_transaction() {
     local path service state

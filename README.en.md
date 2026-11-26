@@ -13,7 +13,7 @@ On first install, the installer detects the public IPv4 address and selects a Re
 | Proxy | Configures sing-box with VLESS Reality on `0.0.0.0:10443/TCP`. The `warp-pipe-proxy` service runs as a dedicated system user and starts at boot. |
 | DNS | The server resolves names through Unbound on `127.0.0.1:5353`. The full client JSON profile sends DNS over HTTPS to `1.1.1.1` through the proxy. |
 | Keys and access | Generates a Reality key pair, a short ID and a separate UUID for the local health check. A fresh installation starts with an empty device list. It stores credentials in `/etc/warp-pipe-proxy/credentials.json` with mode `0600`. Client access to internal addresses is blocked by default. |
-| SSH and networking on a VPS | Opens the proxy port in UFW. Fail2ban bans a source for one hour after five failed SSH logins in ten minutes. Enables TCP BBR when the kernel supports it. With `--container`, the installer skips UFW, fail2ban and BBR. |
+| SSH and networking on a VPS | Opens the proxy port and SSH TCP ports in UFW. Fail2ban bans a source for one hour after five failed SSH logins in ten minutes. Enables TCP BBR when the kernel supports it. With `--container`, the installer skips UFW, fail2ban and BBR. |
 | Checks and recovery | Checks local DNS and makes an HTTPS request through VLESS. Installer logs are in `/var/log/warp-pipe-proxy-installer/` and backups in `/var/lib/warp-pipe-proxy-installer/`. If applying changes fails, the installer attempts to restore the managed files and services. |
 
 ## Installation
@@ -42,10 +42,10 @@ A successful `cd` produces no output.
 
 ### VPS
 
-Run the installer from your SSH session.
+Run the installer on the VPS.
 
 ```bash
-sudo --preserve-env=SSH_CONNECTION ./warp-pipe-proxy.sh install
+sudo ./warp-pipe-proxy.sh install
 ```
 
 <details>
@@ -58,7 +58,7 @@ sudo --preserve-env=SSH_CONNECTION ./warp-pipe-proxy.sh install
 
 </details>
 
-If UFW is active, the installer preserves its SSH rules. When enabling UFW for the first time with an empty ruleset, it allows SSH from your current session’s IP. If installing from a console, set `VPS_SSH_SOURCE` to your admin IP address or CIDR range. If UFW is inactive but already has rules, review them, enable UFW, and verify access by opening a new SSH connection.
+The installer reads the SSH ports from the `sshd` configuration and adds a UFW rule allowing connections from any IP to each port. It also adds these rules when UFW is already active, including when SSH was previously allowed only from your IP.
 
 ### Container
 
@@ -202,7 +202,7 @@ To remove one device, use `device-revoke`. The service restarts and the other de
 
 The server IP, ports and Reality settings are in `/etc/warp-pipe-proxy/settings.json`. To allow clients to reach a private subnet, add `"allowed_private_subnets": ["192.168.50.0/24"]` to that file, using your own CIDR range. The exception applies to all devices. Apply changes with `sudo warp-pipe-proxy install` (add `--container` in a container).
 
-To upgrade, run `git pull --ff-only` in the project directory, then repeat the install command for your setup. When upgrading from the older single-UUID version, existing clients retain access. Export that UUID explicitly with `--device default`. Add any required private subnets before upgrading. If the old `warp-pipe-proxy SSH preservation` UFW rule is still present, open a new SSH session from an allowed IP before removing it.
+To upgrade, run `git pull --ff-only` in the project directory, then repeat the install command for your setup. When upgrading from the older single-UUID version, existing clients retain access. Export that UUID explicitly with `--device default`. Add any required private subnets before upgrading.
 
 <details>
 <summary>Example upgrade and reapply output</summary>

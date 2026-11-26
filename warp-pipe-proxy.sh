@@ -364,7 +364,6 @@ EOF
 apply_validated_configuration() {
     firewall_backend_check
     protect_listeners
-    prepare_ssh_firewall
     begin_transaction
     stage 'Applying validated configurations'
     install -m 600 "$STAGE/settings.json" "$ROOT/settings.json"
@@ -399,11 +398,9 @@ configure_firewall() {
     log 'Applying UFW rules without resetting existing rules'
     # Флаг устанавливаем до первой команды UFW, чтобы откат обработал и частичное применение.
     FIREWALL_CHANGED=1
-    if [[ $UFW_ACTIVE == no ]]; then
-        for port in $SSH_PORTS; do
-            ufw allow proto tcp from "$SSH_SOURCE" to any port "$port" comment 'warp-pipe-proxy SSH source'
-        done
-    fi
+    for port in $SSH_PORTS; do
+        ufw allow "$port/tcp" comment 'warp-pipe-proxy SSH preservation'
+    done
     log 'Removing legacy installer-managed SOCKS firewall rules'
     python3 "$BASE/configure.py" remove-legacy-socks-rules
     ufw allow "$(read_setting vless_port)/tcp" comment 'warp-pipe-proxy Reality'

@@ -44,29 +44,6 @@ ss() {
         result = self.shell('protect_listeners', 'UFW_ACTIVE=yes\nss() { return 99; }')
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_ssh_rules_preserved_with_active_ufw(self):
-        result = self.shell('prepare_ssh_firewall', """
-UFW_ACTIVE=yes
-ufw() { [[ $* == 'show added' ]] || return 1; echo "ufw allow 22/tcp comment 'warp-pipe-proxy SSH preservation'"; }
-""")
-        self.assertEqual(result.returncode, 0)
-        self.assertIn('Legacy unrestricted SSH rule', result.stdout)
-
-    def test_first_enable_requires_a_known_source_and_clean_policy(self):
-        setup = """
-UFW_ACTIVE=no
-SSH_PORTS=22
-unset VPS_SSH_SOURCE SSH_CONNECTION
-ufw() { [[ $* == 'show added' ]] || return 1; echo "${RULES:-}"; }
-"""
-        for environment in ('SSH_CONNECTION="192.0.2.3 4321 192.0.2.5 22"', 'VPS_SSH_SOURCE=192.0.2.0/24'):
-            result = self.shell('prepare_ssh_firewall; echo "$SSH_SOURCE"', setup + environment)
-            self.assertEqual(result.returncode, 0)
-            self.assertIn('192.0.2.', result.stdout)
-        for environment in ('', 'VPS_SSH_SOURCE=invalid', 'SSH_CONNECTION="192.0.2.3 4321 192.0.2.5 23"',
-                            "VPS_SSH_SOURCE=192.0.2.3\nRULES='ufw allow from 192.0.2.3 to any port 22'"):
-            self.assertNotEqual(self.shell('prepare_ssh_firewall', setup + environment).returncode, 0)
-
     def test_listener_query_error_stops_install(self):
         result = self.shell('protect_listeners', 'UFW_ACTIVE=no\nss() { return 42; }')
         self.assertEqual(result.returncode, 42)
