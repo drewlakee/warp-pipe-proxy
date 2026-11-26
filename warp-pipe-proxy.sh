@@ -432,13 +432,9 @@ finish_installation() {
     rm -rf -- "$STAGE"
     banner 'DONE | Installation and local checks completed'
     log SUCCESS 'SUCCESS: VLESS Reality configured'
-    if [[ -f $ROOT/client-sing-box.json ]]; then
-        log "Default client exports: $ROOT/clients.txt and $ROOT/client-sing-box.json"
-    else
-        log 'Default device is revoked; select an active device with --device'
-    fi
-    log WARN 'For LAN access, change the client profile server address to the laptop IP and published port'
-    log 'Next: export a profile with client-profile, import it into sing-box and enable VPN/TUN'
+    log 'List existing devices: warp-pipe-proxy device-list'
+    log 'Add a device: warp-pipe-proxy device-add --device NAME'
+    log 'Export its profile: warp-pipe-proxy client-profile --device NAME (or client-qr --device NAME)'
     log 'Use --endpoint LAPTOP_LAN_IP --port PUBLISHED_PORT when exporting for Podman'
     log 'Diagnostics: sudo warp-pipe-proxy status; sudo warp-pipe-proxy doctor; sudo warp-pipe-proxy logs --follow'
     log "Allow inbound TCP $(read_setting vless_port) in the provider firewall"

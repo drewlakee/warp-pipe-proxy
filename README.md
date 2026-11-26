@@ -12,7 +12,7 @@
 | --- | --- |
 | Прокси | Настраивает sing-box с VLESS Reality на `0.0.0.0:10443/TCP`. Служба `warp-pipe-proxy` запускается от отдельного системного пользователя и включается при загрузке. |
 | DNS | Сервер разрешает имена через Unbound на `127.0.0.1:5353`. Полный клиентский JSON-профиль направляет DNS через прокси к `1.1.1.1` по HTTPS. |
-| Ключи и доступ | При первом запуске создаёт пару ключей Reality, Short ID и UUID профиля `default`. Хранит учётные данные в `/etc/warp-pipe-proxy/credentials.json` с правами `0600`. По умолчанию клиентам закрыт доступ к внутренним адресам. |
+| Ключи и доступ | Создаёт пару ключей Reality, Short ID и отдельный UUID для локальной проверки. Список устройств при первой установке пуст. Хранит учётные данные в `/etc/warp-pipe-proxy/credentials.json` с правами `0600`. По умолчанию клиентам закрыт доступ к внутренним адресам. |
 | Защита SSH и сеть на VPS | Открывает порт прокси в UFW. Fail2ban блокирует источник на час после пяти неудачных входов по SSH за десять минут. При поддержке ядром включает TCP BBR. При запуске с `--container` установщик пропускает UFW, fail2ban и BBR. |
 | Проверка и восстановление | Проверяет локальный DNS и выполняет HTTPS-запрос через VLESS. Сохраняет журнал в `/var/log/warp-pipe-proxy-installer/` и резервную копию в `/var/lib/warp-pipe-proxy-installer/`. При сбое применения пытается восстановить управляемые файлы и службы. |
 
@@ -82,7 +82,7 @@ sudo ./warp-pipe-proxy.sh install --container
 
 ## Подключить устройство
 
-На сервере создайте профиль телефона и выберите формат для клиента.
+На сервере создайте профиль телефона. Для QR-кода, ссылки и JSON всегда указывайте `--device ИМЯ`, даже если устройство одно.
 
 ```bash
 sudo warp-pipe-proxy device-add --device phone
@@ -167,7 +167,7 @@ VLESS Reality authenticated HTTPS request passed
 [INFO] Previous credentials are retained in the root-only backup: /var/lib/warp-pipe-proxy-installer/<RUN>
 ```
 
-Меняются общая пара ключей Reality, Short ID и индивидуальный UUID каждого активного устройства, включая активный `default`. Имена устройств сохраняются. Например, `phone` и `laptop` останутся активными, а отозванный `old-phone` останется отозванным.
+Меняются общая пара ключей Reality, Short ID и индивидуальный UUID каждого активного устройства. Имена устройств сохраняются. Например, `phone` и `laptop` останутся активными, а отозванный `old-phone` останется отозванным.
 
 После сообщения об успехе выведите новый QR для `phone` или экспортируйте JSON для `laptop` командами из раздела [«Подключить устройство»](#подключить-устройство), указав имя нужного устройства в `--device`. Замените профиль в приложении и переподключитесь. Повторять `device-add` не нужно.
 
@@ -188,7 +188,7 @@ VLESS Reality authenticated HTTPS request passed
 | Задача | Команда | Пример вывода (фрагмент) |
 | --- | --- | --- |
 | Отозвать старый телефон | `sudo warp-pipe-proxy device-revoke --device old-phone` | `[SUCCESS] Credential change completed: device-revoke` |
-| Список устройств | `sudo warp-pipe-proxy device-list` | `default	active`<br>`laptop	active`<br>`old-phone	revoked`<br>`phone	active` |
+| Список устройств | `sudo warp-pipe-proxy device-list` | `laptop	active`<br>`old-phone	revoked`<br>`phone	active` |
 | Службы и порт | `sudo warp-pipe-proxy status` | `Proxy service: PASS`<br>`DNS service: PASS`<br>`VLESS TCP port 10443: PASS` |
 | Проверить DNS и VLESS | `sudo warp-pipe-proxy check` | `VLESS Reality authenticated HTTPS request passed` |
 | Проверить в контейнере | `sudo warp-pipe-proxy check --container` | `[WARN] Container mode: UFW and fail2ban checks skipped; host firewall must protect published ports` |
@@ -202,7 +202,7 @@ VLESS Reality authenticated HTTPS request passed
 
 IP, порты и параметры Reality хранятся в `/etc/warp-pipe-proxy/settings.json`. Чтобы открыть клиентам доступ к внутренней подсети, добавьте в этот файл поле `"allowed_private_subnets": ["192.168.50.0/24"]` со своим CIDR. Исключение действует для всех устройств. Примените изменения командой `sudo warp-pipe-proxy install` (в контейнере — с `--container`).
 
-Для обновления выполните `git pull --ff-only` в каталоге проекта и повторите команду установки из выбранного раздела выше. Прежний UUID сохраняется в профиле `default`. Укажите нужные внутренние подсети до обновления. Если осталось старое правило UFW `warp-pipe-proxy SSH preservation`, подтвердите новый SSH-вход с разрешённого IP перед его удалением.
+Для обновления выполните `git pull --ff-only` в каталоге проекта и повторите команду установки из выбранного раздела выше. При обновлении со старой версии с единым UUID существующие подключения сохраняют доступ. Этот UUID доступен по явному имени `--device default`. Укажите нужные внутренние подсети до обновления. Если осталось старое правило UFW `warp-pipe-proxy SSH preservation`, подтвердите новый SSH-вход с разрешённого IP перед его удалением.
 
 <details>
 <summary>Примеры вывода при обновлении и повторном применении</summary>

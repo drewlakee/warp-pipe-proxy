@@ -93,11 +93,14 @@ else:
         sys.exit('Unexpected successful connection')
 PY
 }
-export_profile default
+guest warp-pipe-proxy device-list > "$tmp/initial-devices"
+test ! -s "$tmp/initial-devices"
+guest warp-pipe-proxy device-add --device laptop
+export_profile laptop
 check_ssh_policy
-request default https://example.com
+request laptop https://example.com
 install_proxy
-request default https://example.com
+request laptop https://example.com
 before=$(guest cat /proc/sys/kernel/random/boot_id)
 lxc restart "$name"
 for _ in {1..90}; do
@@ -106,7 +109,7 @@ for _ in {1..90}; do
 done
 [[ $(guest cat /proc/sys/kernel/random/boot_id) != "$before" ]]
 check_ssh_policy
-request default https://example.com
+request laptop https://example.com
 
 # Use disposable HTTP and DNS fixtures wholly inside the guest.
 guest mkdir /run/warp-fixture
@@ -121,9 +124,9 @@ guest systemctl restart unbound
 guest systemctl restart warp-pipe-proxy
 guest curl --noproxy '*' -fsS http://127.0.0.1:18080/ -o /dev/null
 guest curl --noproxy '*' -gfsS 'http://[::1]:18081/' -o /dev/null
-request default http://127.0.0.1:18080/ deny
-request default http://fixture.warp.test:18080/ deny
-request default 'http://[::1]:18081/' deny
+request laptop http://127.0.0.1:18080/ deny
+request laptop http://fixture.warp.test:18080/ deny
+request laptop 'http://[::1]:18081/' deny
 guest python3 - <<'PY'
 import json
 from pathlib import Path
@@ -133,13 +136,11 @@ settings['allowed_private_subnets'] = ['127.0.0.1/32']
 path.write_text(json.dumps(settings))
 PY
 install_proxy
-request default http://fixture.warp.test:18080/
-request default 'http://[::1]:18081/' deny
+request laptop http://fixture.warp.test:18080/
+request laptop 'http://[::1]:18081/' deny
 
 guest warp-pipe-proxy device-add --device phone
-guest warp-pipe-proxy device-add --device laptop
 export_profile phone
-export_profile laptop
 request phone https://example.com
 guest warp-pipe-proxy device-revoke --device phone
 request phone https://example.com deny

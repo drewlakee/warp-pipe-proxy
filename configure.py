@@ -53,6 +53,7 @@ def blocked_destinations(settings):
 def devices(credentials):
     if 'devices' in credentials:
         return credentials['devices']
+    # Preserve the issued credential when upgrading a legacy single-user installation.
     return {'default': credentials['uuid']}
 
 
@@ -206,6 +207,8 @@ def main():
     parser.add_argument('--key')
     parser.add_argument('--device')
     args = parser.parse_args()
+    if args.action == 'client-profile' and args.device is None:
+        parser.error('client-profile requires --device NAME')
     if args.action == 'remove-legacy-socks-rules':
         remove_legacy_socks_rules()
         return
@@ -221,18 +224,21 @@ def main():
                 raise ValueError('Credentials are missing; restore backup instead of rotating silently')
             output = subprocess.check_output(['sing-box', 'generate', 'reality-keypair'], text=True)
             keys = dict(re.findall(r'(PrivateKey|PublicKey):\s*(\S+)', output))
-            write(root / 'credentials.json', {'uuid': str(uuid.uuid4()),
+            write(root / 'credentials.json', {'devices': {}, 'probe_uuid': str(uuid.uuid4()),
                 'short_id': secrets.token_hex(4), 'private_key': keys['PrivateKey'], 'public_key': keys['PublicKey']})
     s = json.loads((root / 'settings.json').read_text())
     c = json.loads((root / 'credentials.json').read_text())
     validate(s, c)
     if args.action == 'client-profile':
-        print(json.dumps(render_client(s, for_device(c, args.device or 'default')), indent=2))
+        print(json.dumps(render_client(s, for_device(c, args.device)), indent=2))
     elif args.action == 'get':
         print(s[args.key])
     elif args.action == 'summary':
         print(json.dumps(s, indent=2))
     elif args.action in ('render', 'render-rotated', 'device-add', 'device-revoke'):
+        # Refresh the old shared export files only for installations that used them.
+        legacy_exports = ('uuid' in c or (root / 'clients.txt').is_file()
+                          or (root / 'client-sing-box.json').is_file())
         c = prepare_credentials(c, args.action, args.device)
         validate(s, c)
         args.out.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -255,7 +261,7 @@ def main():
   rrset-cache-size: 64m
   num-threads: 1
 ''')
-        if devices(c).get('default'):
+        if legacy_exports and devices(c).get('default'):
             default = for_device(c, 'default')
             write(args.out / 'client-sing-box.json', render_client(s, default))
             write(args.out / 'clients.txt', 'VLESS Reality:\n' + render_vless_link(s, default) + '\n')

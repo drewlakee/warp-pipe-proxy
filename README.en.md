@@ -12,7 +12,7 @@ On first install, the installer detects the public IPv4 address and selects a Re
 | --- | --- |
 | Proxy | Configures sing-box with VLESS Reality on `0.0.0.0:10443/TCP`. The `warp-pipe-proxy` service runs as a dedicated system user and starts at boot. |
 | DNS | The server resolves names through Unbound on `127.0.0.1:5353`. The full client JSON profile sends DNS over HTTPS to `1.1.1.1` through the proxy. |
-| Keys and access | On first install, generates a Reality key pair, a short ID and a UUID for the `default` profile. It stores credentials in `/etc/warp-pipe-proxy/credentials.json` with mode `0600`. Client access to internal addresses is blocked by default. |
+| Keys and access | Generates a Reality key pair, a short ID and a separate UUID for the local health check. A fresh installation starts with an empty device list. It stores credentials in `/etc/warp-pipe-proxy/credentials.json` with mode `0600`. Client access to internal addresses is blocked by default. |
 | SSH and networking on a VPS | Opens the proxy port in UFW. Fail2ban bans a source for one hour after five failed SSH logins in ten minutes. Enables TCP BBR when the kernel supports it. With `--container`, the installer skips UFW, fail2ban and BBR. |
 | Checks and recovery | Checks local DNS and makes an HTTPS request through VLESS. Installer logs are in `/var/log/warp-pipe-proxy-installer/` and backups in `/var/lib/warp-pipe-proxy-installer/`. If applying changes fails, the installer attempts to restore the managed files and services. |
 
@@ -82,7 +82,7 @@ Pass `--container` each time you run `install` or `check`. Manage the firewall o
 
 ## Connect a device
 
-On the server, create a profile for the phone, then choose a format your client can import.
+Create a profile for the phone on the server. Always pass `--device NAME` when exporting a QR code, link or JSON profile, even if there is only one device.
 
 ```bash
 sudo warp-pipe-proxy device-add --device phone
@@ -167,7 +167,7 @@ VLESS Reality authenticated HTTPS request passed
 [INFO] Previous credentials are retained in the root-only backup: /var/lib/warp-pipe-proxy-installer/<RUN>
 ```
 
-Rotation replaces the shared Reality key pair and short ID, plus the UUID of every active device, including `default` if active. Device names are preserved. For example, `phone` and `laptop` stay active and a previously revoked `old-phone` stays revoked.
+Rotation replaces the shared Reality key pair and short ID, plus the UUID of every active device. Device names are preserved. For example, `phone` and `laptop` stay active and a previously revoked `old-phone` stays revoked.
 
 After the success message, display a new QR for `phone` or export new JSON for `laptop` using the commands in [Connect a device](#connect-a-device). Pass the device’s own name with `--device`. Replace the profile in the app and reconnect. You do not need to run `device-add` again.
 
@@ -188,7 +188,7 @@ After a successful rollback, the previous profiles work again. If you see `ROLLB
 | Task | Command | Example output (excerpt) |
 | --- | --- | --- |
 | Revoke the old phone | `sudo warp-pipe-proxy device-revoke --device old-phone` | `[SUCCESS] Credential change completed: device-revoke` |
-| List devices | `sudo warp-pipe-proxy device-list` | `default	active`<br>`laptop	active`<br>`old-phone	revoked`<br>`phone	active` |
+| List devices | `sudo warp-pipe-proxy device-list` | `laptop	active`<br>`old-phone	revoked`<br>`phone	active` |
 | Check services and port | `sudo warp-pipe-proxy status` | `Proxy service: PASS`<br>`DNS service: PASS`<br>`VLESS TCP port 10443: PASS` |
 | Test DNS and VLESS | `sudo warp-pipe-proxy check` | `VLESS Reality authenticated HTTPS request passed` |
 | Check in container mode | `sudo warp-pipe-proxy check --container` | `[WARN] Container mode: UFW and fail2ban checks skipped; host firewall must protect published ports` |
@@ -202,7 +202,7 @@ To remove one device, use `device-revoke`. The service restarts and the other de
 
 The server IP, ports and Reality settings are in `/etc/warp-pipe-proxy/settings.json`. To allow clients to reach a private subnet, add `"allowed_private_subnets": ["192.168.50.0/24"]` to that file, using your own CIDR range. The exception applies to all devices. Apply changes with `sudo warp-pipe-proxy install` (add `--container` in a container).
 
-To upgrade, run `git pull --ff-only` in the project directory, then repeat the install command for your setup. The existing UUID is preserved in the `default` profile. Add any required private subnets before upgrading. If the old `warp-pipe-proxy SSH preservation` UFW rule is still present, open a new SSH session from an allowed IP before removing it.
+To upgrade, run `git pull --ff-only` in the project directory, then repeat the install command for your setup. When upgrading from the older single-UUID version, existing clients retain access. Export that UUID explicitly with `--device default`. Add any required private subnets before upgrading. If the old `warp-pipe-proxy SSH preservation` UFW rule is still present, open a new SSH session from an allowed IP before removing it.
 
 <details>
 <summary>Example upgrade and reapply output</summary>

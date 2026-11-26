@@ -21,22 +21,23 @@ def parse_args(argv=None):
     parser.add_argument('--container', action='store_true', help='Do not manage host firewall or fail2ban')
     parser.add_argument('--url', help='HTTP(S) site to compare directly and through VLESS; no redirects followed')
     parser.add_argument('--endpoint', help='Override client server IP (including private LAN IP); does not change server settings')
-    parser.add_argument('--device', help='Device name (default for client exports: default)')
+    parser.add_argument('--device', metavar='NAME', help='Device name for access changes and client exports')
     parser.add_argument('--port', type=int, help='Override published client port')
     parser.add_argument('--follow', action='store_true', help='Follow new journal entries')
     parser.add_argument('--since', help='Journal start time, e.g. "10 minutes ago"')
     parser.add_argument('--filter', help='Literal journal substring, e.g. destination IP or connection ID')
     parser.add_argument('--validate-only', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    device_commands = ('device-add', 'device-revoke', 'client-profile', 'client-config', 'client-qr')
     for names, commands in [(('url',), ('check', 'doctor')), (('endpoint', 'port'), ('client-profile', 'client-qr')),
-                            (('device',), ('device-add', 'device-revoke', 'client-profile', 'client-config', 'client-qr')),
+                            (('device',), device_commands),
                             (('follow', 'since', 'filter'), ('logs',))]:
         if args.command not in commands and any(getattr(args, name) not in (None, False) for name in names):
             parser.error(f'{", ".join(names)} only supported for {", ".join(commands)}')
     if args.device is not None and not configure.valid_device_name(args.device):
         parser.error('--device requires 1..32 lowercase letters, digits, hyphens or underscores')
-    if args.command in ('device-add', 'device-revoke') and args.device is None:
-        parser.error('--device is required')
+    if args.command in device_commands and args.device is None:
+        parser.error(f'{args.command} requires --device NAME')
     if args.endpoint is not None:
         try:
             ipaddress.ip_address(args.endpoint)
@@ -144,7 +145,7 @@ def main():
             for name, value in sorted(configure.devices(credentials).items()):
                 print(name, 'active' if value else 'revoked', sep='\t')
             return 0
-        credentials = configure.for_device(credentials, args.device or 'default')
+        credentials = configure.for_device(credentials, args.device)
         if args.command == 'client-config':
             print('VLESS Reality:')
             print(configure.render_vless_link(settings, credentials))
