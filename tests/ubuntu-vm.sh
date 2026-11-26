@@ -28,7 +28,7 @@ for instance in "$name" "$other"; do
     done
     lxc exec "$instance" -- cloud-init status --wait
 done
-guest env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+guest env DEBIAN_FRONTEND=noninteractive apt-get --error-on=any update
 guest env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ufw
 guest systemctl start ssh
 server=$(guest ip -4 -j route get 1.1.1.1 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["prefsrc"])')
