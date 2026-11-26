@@ -216,7 +216,8 @@ class LifecycleTests(unittest.TestCase):
         manifest['version'] = 1
         manifest['files'] = {name: manifest['files'][name] for name in lifecycle.LEGACY_FILES}
         lifecycle.write_json(self.root / 'ownership.json', manifest)
-        self.manager.target(lifecycle.BUNDLE + '/uninstall_firewall.py').unlink()
+        for name in set(lifecycle.OWNED_FILES) - set(lifecycle.LEGACY_FILES):
+            self.manager.target(name).unlink()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.manager.uninstall()
@@ -232,6 +233,41 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Invalid ownership'):
             self.manager.uninstall()
         self.assertFalse(self.systemd.calls)
+
+    def test_version_two_manifest_can_upgrade_without_changing_credentials(self):
+        manifest = self.manager.read_manifest()
+        manifest['version'] = 2
+        for name in set(lifecycle.OWNED_FILES) - set(lifecycle.V2_FILES):
+            manifest['files'].pop(name)
+        lifecycle.write_json(self.root / 'ownership.json', manifest)
+        original = (self.root / 'credentials.json').read_bytes()
+        self.manager.record()
+        current = self.manager.read_manifest()
+        self.assertEqual(current['version'], 3)
+        self.assertTrue(set(lifecycle.OWNED_FILES).issubset(current['files']))
+        self.assertEqual((self.root / 'credentials.json').read_bytes(), original)
+
+    def test_version_two_installation_without_release_files_can_be_removed(self):
+        manifest = self.manager.read_manifest()
+        manifest['version'] = 2
+        for name in set(lifecycle.OWNED_FILES) - set(lifecycle.V2_FILES):
+            manifest['files'].pop(name)
+            self.manager.target(name).unlink()
+        lifecycle.write_json(self.root / 'ownership.json', manifest)
+        self.assertTrue(self.manager.uninstall())
+        self.assertFalse(self.root.exists())
+
+    def test_current_manifest_requires_release_metadata_and_checker(self):
+        manifest = self.manager.read_manifest()
+        for name in ('VERSION', 'dependencies.lock.json', 'release.py'):
+            with self.subTest(name=name):
+                path = lifecycle.BUNDLE + '/' + name
+                checksum = manifest['files'].pop(path)
+                lifecycle.write_json(self.root / 'ownership.json', manifest)
+                with self.assertRaisesRegex(ValueError, 'Invalid ownership'):
+                    self.manager.uninstall()
+                self.assertFalse(self.systemd.calls)
+                manifest['files'][path] = checksum
 
     def test_manifest_missing_cannot_delete_shared_location_files(self):
         (self.root / 'ownership.json').unlink()

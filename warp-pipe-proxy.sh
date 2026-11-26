@@ -19,6 +19,7 @@ while (( $# )); do
     case "$1" in
         --container) CONTAINER_MODE=1 ;;
         --help|-h) python3 "$BASE/admin.py" --help; exit 0 ;;
+        --version|-V) exec python3 "$BASE/admin.py" --version ;;
         install|check|status|doctor|activity|logs|client-config|client-profile|client-qr|rotate-keys|device-list|device-add|device-revoke|uninstall)
             if (( MODE_SELECTED )); then echo 'Specify only one command'; exit 2; fi
             MODE=$1
@@ -74,6 +75,12 @@ flock -n 9 || { echo 'Another installer is running'; exit 1; }
 # Python загружает нужные модули до удаления установленной команды и её файлов.
 if [[ $MODE == uninstall ]]; then
     exec python3 "$BASE/lifecycle.py" uninstall
+fi
+# Версию среды и существующий движок проверяем до APT, копий и конфигураций.
+RELEASE_ARGS=()
+if (( CONTAINER_MODE )); then RELEASE_ARGS+=(--container); fi
+if [[ $MODE == install ]]; then
+    python3 "$BASE/release.py" preflight "${RELEASE_ARGS[@]}"
 fi
 install -d -m 700 /var/log/warp-pipe-proxy-installer
 RUN=$(date -u +%Y%m%dT%H%M%SZ)-$$
@@ -177,8 +184,10 @@ check_installation_prerequisites() {
     export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
     if ! command -v ss >/dev/null; then
         log 'Installing prerequisite iproute2 (ss) before inspecting network listeners'
+        local prerequisite
+        prerequisite=$(python3 "$BASE/release.py" package iproute2)
         apt-get update
-        apt-get install -y iproute2
+        apt-get install -y "$prerequisite"
         command -v ss >/dev/null || { log ERROR 'iproute2 installation did not provide ss' >&2; exit 1; }
     fi
     # В контейнере SSH не настраиваем: прокси может работать и без SSH-сервера.
@@ -227,8 +236,10 @@ backup_existing_configuration() {
 install_system_dependencies() {
     stage 'Installing system packages'
     apt-get update
-    local packages=(curl ca-certificates openssl python3 dnsutils iproute2 unbound dns-root-data qrencode)
-    if (( ! CONTAINER_MODE )); then packages+=(ufw fail2ban); fi
+    local package_specs
+    local packages=()
+    package_specs=$(python3 "$BASE/release.py" specs "${RELEASE_ARGS[@]}")
+    mapfile -t packages <<< "$package_specs"
     apt-get install -y "${packages[@]}"
     firewall_backend_check
     protect_listeners
@@ -236,6 +247,8 @@ install_system_dependencies() {
 
 # Добавляем подписанный APT-репозиторий только при отсутствии sing-box.
 install_sing_box() {
+    local engine_spec
+    engine_spec=$(python3 "$BASE/release.py" package sing-box)
     stage 'Installing sing-box and checking its version'
     if ! command -v sing-box >/dev/null; then
         log 'Installing sing-box stable from the official APT repository'
@@ -253,7 +266,7 @@ EOF
         chmod 644 /etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources
         APT_SOURCE_CREATED=1
         apt-get update
-        apt-get install -y sing-box
+        apt-get install -y "$engine_spec"
     fi
     sing-box version
 }
@@ -482,6 +495,7 @@ run_installation() {
     backup_existing_configuration
     install_system_dependencies
     install_sing_box
+    python3 "$BASE/release.py" verify "${RELEASE_ARGS[@]}"
     initialize_settings_and_credentials
     prepare_proxy_configuration
     prepare_dns_and_ssh_protection
@@ -495,6 +509,7 @@ run_installation() {
 
 case "$MODE" in
     check)
+        python3 "$BASE/release.py" verify "${RELEASE_ARGS[@]}"
         check_installation
         if [[ -n $CHECK_URL ]]; then
             python3 "$BASE/admin.py" doctor --url "$CHECK_URL"

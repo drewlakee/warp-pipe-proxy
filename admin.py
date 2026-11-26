@@ -17,6 +17,7 @@ ROOT = Path('/etc/warp-pipe-proxy')
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog='warp-pipe-proxy.sh', description='Warp Pipe Proxy: install, inspect and troubleshoot VLESS Reality')
+    parser.add_argument('--version', action='version', version='warp-pipe-proxy ' + Path(__file__).with_name('VERSION').read_text().strip())
     parser.add_argument('command', choices=['install', 'check', 'status', 'doctor', 'logs', 'activity', 'client-config', 'client-profile', 'client-qr', 'rotate-keys',
                                            'device-add', 'device-revoke', 'device-list', 'uninstall'])
     parser.add_argument('--container', action='store_true', help='Do not manage host firewall or fail2ban')

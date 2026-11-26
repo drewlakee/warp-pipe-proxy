@@ -4,9 +4,13 @@
 
 Run a personal VLESS Reality proxy on Ubuntu. Traffic goes through your server, so sites see its IP address. The installer configures sing-box and generates the keys.
 
+**Release `v0.1.0`: Ubuntu 24.04 LTS, `amd64` (x86_64), sing-box `1.14.4`.** The full installation, operation, revocation, removal and fresh installation cycle is exercised in an Ubuntu VM. Other Ubuntu versions and architectures are outside this release's lock file and are rejected during installation. Container mode is available but is not covered by that VM scenario.
+
+[Release notes](docs/releases/v0.1.0.md) · [Changelog](CHANGELOG.md) · [Exact dependency versions](dependencies.lock.json)
+
 ## What the installer configures
 
-On first install, the installer detects the public IPv4 address and selects a Reality handshake server after checking TLS 1.3 and HTTP/2. If sing-box is missing, it adds the official APT repository and installs the package.
+On first install, the installer detects the public IPv4 address and selects a Reality handshake server after checking TLS 1.3 and HTTP/2. If sing-box is missing, it adds the official APT repository and installs the package version pinned by the release.
 
 | Component | Default setup |
 | --- | --- |
@@ -20,13 +24,15 @@ On first install, the installer detects the public IPv4 address and selects a Re
 
 The examples below show output excerpts. Timestamps, addresses and per-run paths vary. Angle brackets stand in for credentials in links and profiles.
 
-Start with a fresh Ubuntu system running systemd and a user with root or sudo access. To connect over the internet, you need a public IPv4 address. Allow inbound **TCP 10443** in your provider’s firewall. The server needs access to APT repositories and outbound HTTPS and DNS (TCP and UDP port 53).
+Start with a fresh **Ubuntu 24.04 LTS (`amd64`) system running systemd** and a user with root or sudo access. To connect over the internet, you need a public IPv4 address. Allow inbound **TCP 10443** in your provider’s firewall. The server needs access to APT repositories and outbound HTTPS and DNS (TCP and UDP port 53). Installed packages must satisfy the [locked dependency rules](#locked-dependencies).
 
-Clone the project on the server or inside the container.
+Clone the project on the server or inside the container and select the release tag.
 
 ```bash
 git clone https://github.com/drewlakee/warp-pipe-proxy.git
 cd warp-pipe-proxy
+git checkout v0.1.0
+./warp-pipe-proxy.sh --version
 ```
 
 <details>
@@ -34,9 +40,10 @@ cd warp-pipe-proxy
 
 ```text
 Cloning into 'warp-pipe-proxy'...
+warp-pipe-proxy 0.1.0
 ```
 
-A successful `cd` produces no output.
+Git output is abbreviated. Checking out the release tag puts the checkout in the normal detached HEAD state. A successful `cd` produces no output.
 
 </details>
 
@@ -68,7 +75,7 @@ Reinstallation preserves an active UFW policy even when this project originally 
 
 ### Container
 
-Use an Ubuntu container that runs systemd as PID 1. When creating the container, publish `-p 10443:10443/tcp` and allow that port in the host firewall. Run the installer inside the container.
+Use an **Ubuntu 24.04 `amd64`** container that runs systemd as PID 1. This mode is available, but `v0.1.0` has no separate full-cycle container validation. When creating the container, publish `-p 10443:10443/tcp` and allow that port in the host firewall. Run the installer inside the container.
 
 ```bash
 sudo ./warp-pipe-proxy.sh install --container
@@ -85,6 +92,31 @@ sudo ./warp-pipe-proxy.sh install --container
 </details>
 
 Pass `--container` each time you run `install` or `check`. Manage the firewall on the host.
+
+## Locked dependencies
+
+[`dependencies.lock.json`](dependencies.lock.json) records the exact direct APT dependency versions for `v0.1.0`, taken from the validated Ubuntu 24.04 `amd64` VM. `install` passes `package=version` specifications to APT, then verifies installed versions before generating and applying configuration. The `check` command also verifies the lock file requirements.
+
+| Package | Exact APT version | Used in |
+| --- | --- | --- |
+| `sing-box` | `1.14.4` | VPS and container |
+| `curl` | `8.5.0-2ubuntu10.16` | VPS and container |
+| `ca-certificates` | `20260816ubuntu0.24.04.2` | VPS and container |
+| `openssl` | `3.0.13-0ubuntu3.16` | VPS and container |
+| `python3` | `3.12.3-0ubuntu2.1` | VPS and container |
+| `dnsutils` | `1:9.18.39-0ubuntu0.24.04.9` | VPS and container |
+| `iproute2` | `6.1.0-1ubuntu6.4` | VPS and container |
+| `unbound` | `1.19.2-1ubuntu3.12` | VPS and container |
+| `dns-root-data` | `2024071801~ubuntu0.24.04.1` | VPS and container |
+| `qrencode` | `4.1.1-1build2` | VPS and container |
+| `ufw` | `0.36.2-6` | VPS only |
+| `fail2ban` | `1.0.2-3ubuntu0.1` | VPS only |
+
+Missing system dependencies are installed; older versions may be upgraded to the listed versions. If an applicable package is already newer, installation stops **before APT or configuration changes**: there is no automatic downgrade. If a required version is unavailable in the configured APT repositories, installation fails instead of selecting another version.
+
+sing-box has a separate rule: an existing package must already be `1.14.4`, and the executable must belong to that package and report the same version. A different engine version, a manual installation or a `sing-box` executable shadowed through `PATH` stops installation before APT or configuration changes. The installer does not automatically upgrade or downgrade an existing engine.
+
+The lock file pins the project's direct dependencies. It does not pin the entire OS image, kernel or transitive package dependencies. In particular, the `python3` version in the table belongs to Ubuntu's metapackage. The full VM package inventory is retained as a [CI validation](.github/workflows/proxy-checks.yml) artifact; the lock file's `provenance` field identifies the source of the chosen versions. The installer adds no `apt-mark hold` or global APT preferences: administrators retain normal control of OS updates, and subsequent `install` and `check` commands verify compatibility with the lock file again.
 
 ## Connect a device
 
@@ -203,6 +235,7 @@ After a successful rollback, the previous profiles work again. If you see `ROLLB
 | Show recent phone requests | `sudo warp-pipe-proxy activity --device phone --since "10 minutes ago"` | `2026-11-26 14:32:08  TCP  example.com:443` |
 | Follow new phone requests | `sudo warp-pipe-proxy activity --device phone --follow` | `2026-11-26 14:32:10  UDP  203.0.113.24:443` |
 | Follow the service log | `sudo warp-pipe-proxy logs --follow` | `… inbound/vless[vless-reality]: [phone] inbound connection to example.com:443` |
+| Show installed command version | `warp-pipe-proxy --version` | `warp-pipe-proxy 0.1.0` |
 | Show help | `warp-pipe-proxy --help` | `usage: warp-pipe-proxy.sh [-h] [--container] …` |
 
 By default, `activity` shows the last request and the connection request count for each profile in the past hour, using the available journal. The summary includes revoked and idle profiles and excludes internal `@probe` checks. Use `--device` to see the UTC time, protocol and destination supplied by that client. One site can generate several requests. The live view starts with new events. Add `--since` to replay history first.
@@ -237,22 +270,19 @@ sudo env VPS_REALITY_HOST=www.microsoft.com ./warp-pipe-proxy.sh install
 
 Once `settings.json` exists, these variables do not override it: make subsequent changes in that file. Manage devices with `device-add`, `device-revoke` and `rotate-keys`; do not manually edit `credentials.json`. Reinstalling over an existing installation preserves UUIDs and Reality keys without rotating them automatically. A new installation after `uninstall` creates new keys. Pass `--container` on every `install` and `check`.
 
-To upgrade, run `git pull --ff-only` in the project directory, then repeat the install command for your setup. When upgrading from the older single-UUID version, existing clients retain access. Export that UUID explicitly with `--device default`. Add any required private subnets before upgrading.
+Moving to a release is a manual operation from the checkout. Read its notes and dependency lock, fetch tags, select the release and run its installer. To move an earlier checkout to `v0.1.0`:
 
-<details>
-<summary>Example upgrade and reapply output</summary>
-
-```text
-$ git pull --ff-only
-Already up to date.
-
-$ sudo warp-pipe-proxy install
-[SUCCESS] SUCCESS: VLESS Reality configured
+```bash
+git fetch --tags origin
+git checkout v0.1.0
+./warp-pipe-proxy.sh --version
+sudo ./warp-pipe-proxy.sh install
+warp-pipe-proxy --version
 ```
 
-This example shows a checkout that is already up to date. After downloading a new version, run the installer from the checkout as shown above. `sudo warp-pipe-proxy install` reapplies the version already installed.
+Add `--container` to `install` in a container. `./warp-pipe-proxy.sh --version` reports the source checkout version; `warp-pipe-proxy --version` reports the installed copy. Neither version command needs sudo. `sudo warp-pipe-proxy install` reapplies the installed copy without downloading a newer release. `v0.1.0` has no automatic update command. An existing different sing-box version requires an administrator's separate decision before installation: selecting a tag does not bypass the engine and dependency checks.
 
-</details>
+When moving from the older single-UUID version, existing clients retain access. Export that UUID explicitly with `--device default`. Add any required private subnets before moving to this release.
 
 ## File layout
 
@@ -282,6 +312,7 @@ Do not edit the internal markers or hashes manually. See [Management and diagnos
 | `/etc/systemd/system/warp-pipe-proxy.service` | Generated service unit; root, mode `0644`. Runs sing-box as `warp-pipe-proxy` and depends on Unbound. |
 | `/usr/local/bin/warp-pipe-proxy` | Command launcher; root, mode `0755`. Uses the installed project copy, so routine management does not require the original checkout. |
 | `/usr/local/lib/warp-pipe-proxy/` | Installed shell/Python modules and the `.managed` marker; directory mode `0755`, root-owned files with mode `0644`. Updated when installing from a checkout. |
+| `/usr/local/lib/warp-pipe-proxy/{VERSION,dependencies.lock.json,release.py}` | Release number, exact direct dependency versions and their validation code. Copied with the installed command, contain no secrets, and create no additional state under `/etc/warp-pipe-proxy/`. |
 | `/var/lib/warp-pipe-proxy/` | Working directory and home directory for the `warp-pipe-proxy` system user. Keys and settings are stored separately under `/etc/warp-pipe-proxy/`. |
 | `/etc/apt/sources.list.d/warp-pipe-proxy-sagernet.sources` | Definition for the official sing-box APT repository; root, mode `0644`. Added when sing-box is not already installed; the project-owned file is removed by `uninstall`. |
 | `/etc/apt/keyrings/sagernet.asc` | Shared sing-box repository key; root, mode `0644`. Other APT sources may use it, so it is retained after project removal. |
